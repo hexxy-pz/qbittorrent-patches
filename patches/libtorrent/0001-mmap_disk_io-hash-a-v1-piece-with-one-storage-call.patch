@@ -1,0 +1,130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anonymous <anonymous@localhost>
+Date: Wed, 30 Sep 2026 15:27:58 +0000
+Subject: [PATCH 1/4] mmap_disk_io: hash a v1 piece with one storage call
+
+do_hash() made one storage call per 16 kiB block. Each call takes the
+store buffer and file pool mutexes, reads with pread() and allocates a
+scratch buffer. With several hashing threads they mostly wait on each
+other.
+
+Hash a v1 piece that has none of its blocks in the store buffer with a
+single storage call. v2 pieces and pieces with pending writes keep the
+per-block path. Files that are not memory mapped are read in 256 kiB
+chunks, so the scratch buffer stays bounded.
+
+Upstream: https://github.com/arvidn/libtorrent/pull/8937 (commit e8828e067). Only the
+library files; the PR's tests and ChangeLog entry target 2.0.15 and are not built here.
+---
+ include/libtorrent/aux_/store_buffer.hpp | 12 ++++++++++++
+ src/mmap_disk_io.cpp                     | 24 ++++++++++++++++++++++++
+ src/mmap_storage.cpp                     | 21 +++++++++++++++++----
+ 3 files changed, 53 insertions(+), 4 deletions(-)
+
+diff --git a/include/libtorrent/aux_/store_buffer.hpp b/include/libtorrent/aux_/store_buffer.hpp
+index 68213ae4c..45dd05e5f 100644
+--- a/include/libtorrent/aux_/store_buffer.hpp
++++ b/include/libtorrent/aux_/store_buffer.hpp
+@@ -37,6 +37,7 @@ POSSIBILITY OF SUCH DAMAGE.
+ #include <mutex>
+ 
+ #include "libtorrent/storage_defs.hpp"
++#include "libtorrent/disk_interface.hpp" // for default_block_size
+ 
+ #include "libtorrent/aux_/disable_warnings_push.hpp"
+ #include <boost/functional/hash.hpp>
+@@ -118,6 +119,17 @@ struct store_buffer
+ 		return f(buf1, buf2);
+ 	}
+ 
++	// returns true if any of the first `blocks` blocks of the piece is waiting
++	// to be written
++	bool has_piece(storage_index_t const torrent, piece_index_t const piece
++		, int const blocks) const
++	{
++		std::unique_lock<std::mutex> l(m_mutex);
++		for (int i = 0; i < blocks; ++i)
++			if (m_store_buffer.count({torrent, piece, i * default_block_size})) return true;
++		return false;
++	}
++
+ 	void insert(torrent_location const loc, char const* buf)
+ 	{
+ 		std::lock_guard<std::mutex> l(m_mutex);
+diff --git a/src/mmap_disk_io.cpp b/src/mmap_disk_io.cpp
+index 78b34d285..6cb8b24cf 100644
+--- a/src/mmap_disk_io.cpp
++++ b/src/mmap_disk_io.cpp
+@@ -1043,6 +1043,30 @@ TORRENT_EXPORT std::unique_ptr<disk_interface> mmap_disk_io_constructor(
+ 		TORRENT_ASSERT(!v2 || int(j->d.h.block_hashes.size()) >= blocks_in_piece2);
+ 		TORRENT_ASSERT(v1 || v2);
+ 
++		// a v1 piece with none of its blocks in the store buffer (every piece of
++		// a recheck) is hashed with a single storage call, rather than one call
++		// per block
++		if (v1 && !v2 && !m_store_buffer.has_piece(j->storage->storage_index(), j->piece
++			, blocks_in_piece))
++		{
++			time_point const start_time = clock_type::now();
++			hasher h;
++			j->error.ec.clear();
++			int const ret = j->storage->hash(m_settings, h, piece_size, j->piece, 0
++				, file_mode, j->flags, j->error);
++			if (!j->error.ec)
++			{
++				std::int64_t const read_time = total_microseconds(clock_type::now() - start_time);
++				m_stats_counters.inc_stats_counter(counters::num_read_back, blocks_in_piece);
++				m_stats_counters.inc_stats_counter(counters::num_blocks_read, blocks_in_piece);
++				m_stats_counters.inc_stats_counter(counters::num_read_ops);
++				m_stats_counters.inc_stats_counter(counters::disk_hash_time, read_time);
++				m_stats_counters.inc_stats_counter(counters::disk_job_time, read_time);
++			}
++			j->d.h.piece_hash = h.final();
++			return ret >= 0 ? status_t::no_error : status_t::fatal_disk_error;
++		}
++
+ 		hasher h;
+ 		int ret = 0;
+ 		int offset = 0;
+diff --git a/src/mmap_storage.cpp b/src/mmap_storage.cpp
+index 9d7ee1fb8..2b75a6779 100644
+--- a/src/mmap_storage.cpp
++++ b/src/mmap_storage.cpp
+@@ -71,6 +71,9 @@ namespace libtorrent {
+ 
+ namespace {
+ 
++	// files that are not memory mapped are hashed in chunks of this size
++	constexpr std::ptrdiff_t hash_read_size = 256 * 1024;
++
+ error_code translate_error(std::error_code const& err, bool const write)
+ {
+ 	// We don't really know why we failed to read or write. SIGBUS essentially
+@@ -776,10 +779,20 @@ error_code translate_error(std::error_code const& err, bool const write)
+ 
+ 			if (!handle->has_memory_map())
+ 			{
+-				scratch.resize(std::size_t(buf.size()));
+-				int const ret = aux::pread_all(handle->fd(), scratch, file_offset, ec.ec);
+-				if (ec) return -1;
+-				ph.update(scratch);
++				// a single call may cover a whole piece, read it in bounded chunks
++				scratch.resize(std::size_t(std::min(buf.size(), hash_read_size)));
++				int ret = 0;
++				for (std::ptrdiff_t left = buf.size(); left > 0;)
++				{
++					span<char> const b(scratch.data(), std::min(left, std::ptrdiff_t(scratch.size())));
++					int const r = aux::pread_all(handle->fd(), b, file_offset + ret, ec.ec);
++					if (ec) return -1;
++					ph.update(b.first(r));
++					ret += r;
++					left -= r;
++					// pread_all() on windows does not report a short read as an error
++					if (r < b.size()) break;
++				}
+ 				return ret;
+ 			}
+ 
+-- 
+2.47.3
+

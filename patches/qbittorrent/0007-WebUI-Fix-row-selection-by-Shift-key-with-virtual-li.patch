@@ -1,0 +1,39 @@
+From 9c2b718cef286621ec812a88108118654e1d4f56 Mon Sep 17 00:00:00 2001
+From: tehcneko <chsqwyx@gmail.com>
+Date: Sun, 30 Nov 2025 19:14:30 +0800
+Subject: [PATCH 07/12] WebUI: Fix row selection by Shift key with virtual list
+ enabled
+
+Fixes #23336.
+PR #23543.
+
+(cherry picked from commit 296c90d688eabffba6f4be72a317a5aaf7db5b6d)
+---
+ src/webui/www/private/scripts/dynamicTable.js | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/src/webui/www/private/scripts/dynamicTable.js b/src/webui/www/private/scripts/dynamicTable.js
+index e8afd658b..2621dab37 100644
+--- a/src/webui/www/private/scripts/dynamicTable.js
++++ b/src/webui/www/private/scripts/dynamicTable.js
+@@ -762,13 +762,13 @@ window.qBittorrent.DynamicTable ??= (() => {
+             }
+ 
+             let select = false;
+-            for (const tr of this.getTrs()) {
+-                if ((tr.rowId === rowId1) || (tr.rowId === rowId2)) {
++            for (const row of this.getFilteredAndSortedRows()) {
++                if ((row.rowId === rowId1) || (row.rowId === rowId2)) {
+                     select = !select;
+-                    this.selectedRows.push(tr.rowId);
++                    this.selectedRows.push(row.rowId);
+                 }
+                 else if (select) {
+-                    this.selectedRows.push(tr.rowId);
++                    this.selectedRows.push(row.rowId);
+                 }
+             }
+             this.setRowClass();
+-- 
+2.47.3
+

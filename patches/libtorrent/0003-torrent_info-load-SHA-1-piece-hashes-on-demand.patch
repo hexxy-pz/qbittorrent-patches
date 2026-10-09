@@ -1,0 +1,680 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anonymous <anonymous@localhost>
+Date: Fri, 09 Oct 2026 01:20:55 +0000
+Subject: [PATCH 3/4] torrent_info: load SHA-1 piece hashes on demand
+
+torrent_info::load_piece_hashes_on_demand(loader, keep_loaded) moves the v1
+piece hashes, usually ~99% of a torrent's metadata, out of memory. The info
+section kept in memory gets an empty "pieces" string (file names and other
+borrowed pointers are rebased onto it). hash_for_piece(), hash_for_piece_ptr()
+and info_section() load the full section through the client's loader, check it
+against the info-hash, and keep it, shared by all copies of the object, until
+release_unused_piece_hashes(idle) finds it idle. A failed load throws
+system_error (no_metadata), which puts the torrent into an error state instead
+of failing its pieces. info_section_size() gives the size without loading.
+
+To avoid thrashing, a torrent whose hashes are needed again within the idle
+time they were released after waits twice as long before the next release (up
+to 16 times); a reload after a longer pause halves it again.
+
+ut_metadata only needs the size for its handshake and request checks, so it
+no longer loads the section for them, and its on_piece_pass() no longer reads
+it for nothing (a leftover from when it copied the metadata).
+
+A seed that is not in seed mode only needs its hashes for a recheck or to write
+out its metadata, so a client can keep them on disk for idle torrents.
+---
+ include/libtorrent/file_storage.hpp |   8 ++
+ include/libtorrent/torrent_info.hpp |  50 +++++++-
+ src/file_storage.cpp                |  26 ++++
+ src/torrent_info.cpp                | 177 ++++++++++++++++++++++++++-
+ src/ut_metadata.cpp                 |  24 ++--
+ test/test_torrent_info.cpp          | 182 ++++++++++++++++++++++++++++
+ 6 files changed, 450 insertions(+), 17 deletions(-)
+
+diff --git a/include/libtorrent/file_storage.hpp b/include/libtorrent/file_storage.hpp
+index 805039739..8262dd481 100644
+--- a/include/libtorrent/file_storage.hpp
++++ b/include/libtorrent/file_storage.hpp
+@@ -650,6 +650,14 @@ namespace aux {
+ 		// internal
+ 		void canonicalize_impl(bool backwards_compatible);
+ 
++		// internal
++		// moves the pointers this object borrows from a buffer (file names, file
++		// hashes, v2 roots) from [old_begin, old_begin + size) to the same offsets
++		// in new_begin. Returns false, changing nothing, if one of them points into
++		// [old_begin + size, old_end).
++		bool rebase_borrowed_pointers(char const* old_begin, char const* old_end
++			, int size, char const* new_begin);
++
+ 	private:
+ 
+ 		std::string internal_file_path(file_index_t index) const;
+diff --git a/include/libtorrent/torrent_info.hpp b/include/libtorrent/torrent_info.hpp
+index b8895917f..ac5e3c845 100644
+--- a/include/libtorrent/torrent_info.hpp
++++ b/include/libtorrent/torrent_info.hpp
+@@ -45,6 +45,7 @@ POSSIBILITY OF SUCH DAMAGE.
+ #include <vector>
+ #include <map>
+ #include <memory>
++#include <functional>
+ 
+ #include "libtorrent/aux_/disable_warnings_push.hpp"
+ #include <boost/shared_array.hpp>
+@@ -75,6 +76,8 @@ namespace aux {
+ 		, string_view element, bool force_element = false);
+ 	TORRENT_EXTRA_EXPORT bool verify_encoding(std::string& target);
+ 
++	struct piece_hash_store;
++
+ 	struct internal_drained_state
+ 	{
+ 		aux::vector<lt::announce_entry> urls;
+@@ -166,6 +169,11 @@ namespace aux {
+ 
+ 	using torrent_info_flags_t = flags::bitfield_flag<std::uint8_t, struct torrent_info_flags_tag>;
+ 
++	// fetches a torrent's info section (the bencoded "info" dictionary, byte for
++	// byte as in the .torrent file) for torrent_info::load_piece_hashes_on_demand().
++	// It may be called from any thread. Returns an empty vector if it cannot.
++	using info_section_loader = std::function<std::vector<char>(info_hash_t const&)>;
++
+ TORRENT_VERSION_NAMESPACE_3
+ 
+ 	// the torrent_info class holds the information found in a .torrent file.
+@@ -541,6 +549,7 @@ TORRENT_VERSION_NAMESPACE_3
+ 		sha1_hash hash_for_piece(piece_index_t index) const;
+ 		char const* hash_for_piece_ptr(piece_index_t const index) const
+ 		{
++			if (m_hash_store) return loaded_hash_for_piece_ptr(index);
+ 			TORRENT_ASSERT_PRECOND(index >= piece_index_t(0));
+ 			TORRENT_ASSERT_PRECOND(index < m_files.end_piece());
+ 			TORRENT_ASSERT(is_loaded());
+@@ -629,7 +638,36 @@ TORRENT_VERSION_NAMESPACE_3
+ 		// returns a the raw info section of the torrent file.
+ 		// The underlying buffer is still owned by the torrent_info object
+ 		span<char const> info_section() const
+-		{ return span<char const>(m_info_section.get(), m_info_section_size); }
++		{
++			if (m_hash_store) return loaded_info_section();
++			return span<char const>(m_info_section.get(), m_info_section_size);
++		}
++
++		// Moves the SHA-1 piece hashes out of memory. While they are not loaded,
++		// hash_for_piece(), hash_for_piece_ptr() and info_section() fetch the
++		// info section with ``loader``, check it against the info-hash, and keep
++		// it until release_unused_piece_hashes() finds it idle. They throw
++		// system_error if it cannot be loaded. With ``keep_loaded`` the hashes
++		// stay in memory until that first release. Copies of this object share
++		// the loaded hashes. Only v1-only torrents are supported. This must be
++		// called before the object is shared with other threads (e.g. added to a
++		// session). Returns false, changing nothing, if it is not supported.
++		bool load_piece_hashes_on_demand(info_section_loader loader, bool keep_loaded);
++
++		// Thread safe. If the piece hashes are loaded on demand and have not been
++		// used for ``idle``, releases them; the memory is freed by the next call
++		// (meant to be called periodically), so pointers returned by
++		// hash_for_piece_ptr() and info_section() stay valid until then. Returns
++		// true if the hashes were released. To avoid thrashing, each time the hashes are needed again
++		// within the idle time they were released after, ``idle`` is doubled for
++		// this torrent (up to 16 times); a reload after a longer pause halves it.
++		bool release_unused_piece_hashes(time_duration idle) const;
++
++		// false if the piece hashes are loaded on demand and not in memory now.
++		bool piece_hashes_loaded() const;
++
++		// the size of info_section(), without loading it
++		int info_section_size() const;
+ 
+ #if TORRENT_ABI_VERSION <= 2
+ 		// swap the content of this and ``ti``.
+@@ -641,7 +679,7 @@ TORRENT_VERSION_NAMESPACE_3
+ 		// Even though the bytes returned by ``metadata()`` are not ``const``,
+ 		// they must not be modified.
+ 		TORRENT_DEPRECATED
+-		int metadata_size() const { return m_info_section_size; }
++		int metadata_size() const { return info_section_size(); }
+ 		TORRENT_DEPRECATED
+ 		boost::shared_array<char> metadata() const;
+ #endif
+@@ -692,6 +730,9 @@ TORRENT_VERSION_NAMESPACE_3
+ 
+ 	private:
+ 
++		char const* loaded_hash_for_piece_ptr(piece_index_t index) const;
++		span<char const> loaded_info_section() const;
++
+ 		// populate the piece layers from the metadata
+ 		bool parse_piece_layers(bdecode_node const& e, error_code& ec);
+ 
+@@ -772,6 +813,11 @@ TORRENT_VERSION_NAMESPACE_3
+ 		// parsed lazily
+ 		mutable bdecode_node m_info_dict;
+ 
++		// set by load_piece_hashes_on_demand(). m_info_section then holds the
++		// info section with an empty "pieces" string, and the full one is loaded
++		// into (and released from) this store, shared with copies of this object.
++		std::shared_ptr<aux::piece_hash_store> m_hash_store;
++
+ 		// if a creation date is found in the torrent file
+ 		// this will be set to that, otherwise it'll be
+ 		// 1970, Jan 1
+diff --git a/src/file_storage.cpp b/src/file_storage.cpp
+index 175d49a44..4c0150c1e 100644
+--- a/src/file_storage.cpp
++++ b/src/file_storage.cpp
+@@ -1333,6 +1333,32 @@ namespace {
+ 		m_total_size = off;
+ 	}
+ 
++	bool file_storage::rebase_borrowed_pointers(char const* const old_begin
++		, char const* const old_end, int const size, char const* const new_begin)
++	{
++		char const* const keep_end = old_begin + size;
++		auto const movable = [=](char const* p)
++		{ return p == nullptr || p < old_begin || p >= old_end || p < keep_end; };
++		auto const rebase = [=](char const*& p)
++		{ if (p != nullptr && p >= old_begin && p < keep_end) p = new_begin + (p - old_begin); };
++
++		for (auto const& f : m_files)
++		{
++			if (f.name_len != aux::file_entry::name_is_owned && !movable(f.name)) return false;
++			if (!movable(f.root)) return false;
++		}
++		for (char const* h : m_file_hashes)
++			if (!movable(h)) return false;
++
++		for (auto& f : m_files)
++		{
++			if (f.name_len != aux::file_entry::name_is_owned) rebase(f.name);
++			rebase(f.root);
++		}
++		for (char const*& h : m_file_hashes) rebase(h);
++		return true;
++	}
++
+ 	void file_storage::sanitize_symlinks()
+ 	{
+ 		// symlinks are unusual, this function is optimized assuming there are no
+diff --git a/src/torrent_info.cpp b/src/torrent_info.cpp
+index 9d85c974c..aff8b63e2 100644
+--- a/src/torrent_info.cpp
++++ b/src/torrent_info.cpp
+@@ -73,6 +73,7 @@ POSSIBILITY OF SUCH DAMAGE.
+ #include <set>
+ #include <ctime>
+ #include <array>
++#include <mutex>
+ 
+ namespace libtorrent {
+ 
+@@ -1069,8 +1070,176 @@ namespace {
+ 		m_flags |= v2_has_piece_hashes;
+ 	}
+ 
++namespace aux {
++
++	// the full info section of a torrent_info whose piece hashes are loaded on
++	// demand, see torrent_info::load_piece_hashes_on_demand()
++	struct piece_hash_store
++	{
++		piece_hash_store(info_section_loader l, info_hash_t const& ih
++			, int const size_, int const hashes_, int const num_pieces_)
++			: loader(std::move(l)), info_hash(ih), size(size_), hashes(hashes_)
++			, num_pieces(num_pieces_)
++		{}
++
++		// returns the loaded info section. The caller holds the mutex
++		char const* load()
++		{
++			last_used = clock_type::now();
++			if (section) return section.get();
++
++			// needed again within the idle time it was released after: that was
++			// too early, so wait longer next time. A late reload shortens it again.
++			if (released_at != time_point() && last_used - released_at < released_idle)
++				backoff = std::min(backoff + 1, max_backoff);
++			else if (backoff > 0)
++				--backoff;
++
++			std::vector<char> buf = loader(info_hash);
++			if (int(buf.size()) != size
++				|| hasher(buf).final() != info_hash.v1)
++			{
++				aux::throw_ex<system_error>(errors::no_metadata);
++			}
++			section.reset(new char[std::size_t(size)]);
++			std::memcpy(section.get(), buf.data(), std::size_t(size));
++			return section.get();
++		}
++
++		info_section_loader const loader;
++		info_hash_t const info_hash;
++		// the number of bytes in the full info section
++		int const size;
++		// the offset of the first piece hash in it
++		int const hashes;
++		int const num_pieces;
++
++		std::mutex mutex;
++		// the full info section, or null while it is released
++		boost::shared_array<char> section;
++		// the section released last, freed by the next release call: pointers
++		// handed out by hash_for_piece_ptr() and info_section() (to other threads,
++		// too) stay valid until then
++		boost::shared_array<char> retired;
++		time_point last_used;
++
++		// the idle time passed to release_unused_piece_hashes() is doubled this
++		// many times (premature releases), up to 16 times
++		static constexpr int max_backoff = 4;
++		int backoff = 0;
++		time_point released_at;
++		time_duration released_idle{};
++	};
++}
++
+ 	sha1_hash torrent_info::hash_for_piece(piece_index_t const index) const
+-	{ return sha1_hash(hash_for_piece_ptr(index)); }
++	{
++		if (m_hash_store)
++		{
++			std::lock_guard<std::mutex> l(m_hash_store->mutex);
++			return sha1_hash(m_hash_store->load() + m_hash_store->hashes
++				+ static_cast<int>(index) * 20);
++		}
++		return sha1_hash(hash_for_piece_ptr(index));
++	}
++
++	char const* torrent_info::loaded_hash_for_piece_ptr(piece_index_t const index) const
++	{
++		TORRENT_ASSERT_PRECOND(index >= piece_index_t(0));
++		TORRENT_ASSERT_PRECOND(static_cast<int>(index) < m_hash_store->num_pieces);
++		std::lock_guard<std::mutex> l(m_hash_store->mutex);
++		return m_hash_store->load() + m_hash_store->hashes + static_cast<int>(index) * 20;
++	}
++
++	span<char const> torrent_info::loaded_info_section() const
++	{
++		std::lock_guard<std::mutex> l(m_hash_store->mutex);
++		return span<char const>(m_hash_store->load(), m_hash_store->size);
++	}
++
++	bool torrent_info::load_piece_hashes_on_demand(info_section_loader loader
++		, bool const keep_loaded)
++	{
++		if (m_hash_store || !loader || !is_loaded() || m_orig_files) return false;
++		if (!m_info_hash.has_v1() || m_info_hash.has_v2()) return false;
++		if (m_piece_hashes <= 0) return false;
++
++		// "pieces" is a bencoded string: "<length>:<hashes>"
++		std::int64_t const hash_bytes = std::int64_t(num_pieces()) * 20;
++		std::string const header = std::to_string(hash_bytes) + ":";
++		int const hashes_begin = m_piece_hashes;
++		std::int64_t const hashes_end = hashes_begin + hash_bytes;
++		int const header_begin = hashes_begin - int(header.size());
++		if (header_begin <= 0 || hashes_end > m_info_section_size) return false;
++		char const* const full = m_info_section.get();
++		if (std::memcmp(full + header_begin, header.data(), header.size()) != 0)
++			return false;
++
++		// the in-memory info section keeps everything but the hashes, which become
++		// an empty string, so it still parses (info(), ssl_cert())
++		int const removed = int(hashes_end) - header_begin - 2;
++		int const compact_size = m_info_section_size - removed;
++		boost::shared_array<char> compact(new char[std::size_t(compact_size)]);
++		std::memcpy(compact.get(), full, std::size_t(header_begin));
++		std::memcpy(compact.get() + header_begin, "0:", 2);
++		std::memcpy(compact.get() + header_begin + 2, full + hashes_end
++			, std::size_t(m_info_section_size - hashes_end));
++
++		// file names (and file hashes) come before "pieces" in the info dictionary
++		if (!m_files.rebase_borrowed_pointers(full, full + m_info_section_size
++			, header_begin, compact.get()))
++		{
++			return false;
++		}
++		// "similar" sorts after "pieces"
++		for (auto& st : m_similar_torrents)
++			if (st >= hashes_end) st -= removed;
++		for (auto& c : m_collections)
++			if (c.first >= hashes_end) c.first -= removed;
++
++		m_hash_store = std::make_shared<aux::piece_hash_store>(std::move(loader)
++			, m_info_hash, m_info_section_size, hashes_begin, num_pieces());
++		if (keep_loaded)
++		{
++			m_hash_store->section = m_info_section;
++			m_hash_store->last_used = clock_type::now();
++		}
++
++		m_info_dict = bdecode_node();
++		m_info_section = std::move(compact);
++		m_info_section_size = compact_size;
++		m_piece_hashes = 0;
++		return true;
++	}
++
++	bool torrent_info::release_unused_piece_hashes(time_duration const idle) const
++	{
++		if (!m_hash_store) return false;
++		std::lock_guard<std::mutex> l(m_hash_store->mutex);
++		auto& store = *m_hash_store;
++		store.retired.reset();
++		if (!store.section) return false;
++		time_duration const effective_idle = idle * (1 << store.backoff);
++		time_point const now = clock_type::now();
++		if (now - store.last_used < effective_idle) return false;
++		store.retired = std::move(store.section);
++		store.section.reset();
++		store.released_at = now;
++		store.released_idle = effective_idle;
++		return true;
++	}
++
++	int torrent_info::info_section_size() const
++	{
++		return m_hash_store ? m_hash_store->size : m_info_section_size;
++	}
++
++	bool torrent_info::piece_hashes_loaded() const
++	{
++		if (!m_hash_store) return true;
++		std::lock_guard<std::mutex> l(m_hash_store->mutex);
++		return bool(m_hash_store->section);
++	}
+ 
+ 	void torrent_info::copy_on_write()
+ 	{
+@@ -1093,8 +1262,9 @@ namespace {
+ 
+ 	boost::shared_array<char> torrent_info::metadata() const
+ 	{
+-		boost::shared_array<char> ret(new char[std::size_t(m_info_section_size)]);
+-		std::memcpy(ret.get(), m_info_section.get(), std::size_t(m_info_section_size));
++		span<char const> const section = info_section();
++		boost::shared_array<char> ret(new char[std::size_t(section.size())]);
++		std::memcpy(ret.get(), section.data(), std::size_t(section.size()));
+ 		return ret;
+ 	}
+ #endif
+@@ -1901,6 +2071,7 @@ namespace {
+ 		}
+ 
+ 		TORRENT_ASSERT(m_piece_hashes <= m_info_section_size);
++		TORRENT_ASSERT(!m_hash_store || m_piece_hashes == 0);
+ 	}
+ #endif
+ 
+diff --git a/src/ut_metadata.cpp b/src/ut_metadata.cpp
+index 205b95217..7018d2742 100644
+--- a/src/ut_metadata.cpp
++++ b/src/ut_metadata.cpp
+@@ -127,6 +127,14 @@ namespace {
+ 			return ret;
+ 		}
+ 
++		// the size of metadata(), without loading piece hashes that are loaded on demand
++		int metadata_size() const
++		{
++			if (!m_metadata.empty()) return int(m_metadata.size());
++			if (!m_torrent.valid_metadata()) return 0;
++			return m_torrent.torrent_file().info_section_size();
++		}
++
+ 		bool received_metadata(ut_metadata_peer_plugin& source
+ 			, span<char const> buf, int piece, int total_size);
+ 
+@@ -135,14 +143,6 @@ namespace {
+ 		// returns -1 if we should hold off the request
+ 		int metadata_request(bool has_metadata);
+ 
+-		void on_piece_pass(piece_index_t) override
+-		{
+-			// if we became a seed, copy the metadata from
+-			// the torrent before it is deallocated
+-			if (m_torrent.is_seed())
+-				metadata();
+-		}
+-
+ 		void metadata_size(int const size)
+ 		{
+ 			if (m_torrent.valid_metadata()) return;
+@@ -200,7 +200,7 @@ namespace {
+ 			entry& messages = h["m"];
+ 			messages["ut_metadata"] = 2;
+ 			if (m_torrent.valid_metadata())
+-				h["metadata_size"] = m_tp.metadata().size();
++				h["metadata_size"] = m_tp.metadata_size();
+ 		}
+ 
+ 		// called when the extension handshake from the other end is received
+@@ -248,7 +248,7 @@ namespace {
+ 			int metadata_piece_size = 0;
+ 
+ 			if (m_torrent.valid_metadata())
+-				e["total_size"] = m_tp.metadata().size();
++				e["total_size"] = m_tp.metadata_size();
+ 
+ 			if (type == msg_t::piece)
+ 			{
+@@ -344,7 +344,7 @@ namespace {
+ 				case msg_t::request:
+ 				{
+ 					if (!m_torrent.valid_metadata()
+-						|| piece < 0 || piece >= (m_tp.metadata().size() + 16 * 1024 - 1) / (16 * 1024))
++						|| piece < 0 || piece >= (m_tp.metadata_size() + 16 * 1024 - 1) / (16 * 1024))
+ 					{
+ #ifndef TORRENT_DISABLE_LOGGING
+ 						if (m_pc.should_log(peer_log_alert::info))
+@@ -353,7 +353,7 @@ namespace {
+ 								, "have: %d invalid piece %d metadata size: %d"
+ 								, int(m_torrent.valid_metadata()), piece
+ 								, m_torrent.valid_metadata()
+-									? int(m_tp.metadata().size()) : 0);
++									? m_tp.metadata_size() : 0);
+ 						}
+ #endif
+ 						write_metadata_packet(msg_t::dont_have, piece);
+diff --git a/test/test_torrent_info.cpp b/test/test_torrent_info.cpp
+index 449d6ae47..2b75c85bb 100644
+--- a/test/test_torrent_info.cpp
++++ b/test/test_torrent_info.cpp
+@@ -53,6 +53,7 @@ POSSIBILITY OF SUCH DAMAGE.
+ #include "libtorrent/alert_types.hpp"
+ 
+ #include <iostream>
++#include <thread>
+ 
+ using namespace lt;
+ 
+@@ -1856,3 +1857,184 @@ TORRENT_TEST(add_tracker_reject_invalid_url)
+ 	ti.clear_trackers();
+ 	TEST_EQUAL(ti.trackers().size(), 0);
+ }
++
++namespace {
++
++std::vector<char> make_v1_torrent(int const num_files)
++{
++	file_storage fs;
++	for (int i = 0; i < num_files; ++i)
++		fs.add_file("test/file-" + std::to_string(i), 0x4000 * 3 + 100 * i);
++	lt::create_torrent t(fs, 0x4000, create_torrent::v1_only);
++	for (auto const i : fs.piece_range())
++	{
++		sha1_hash h;
++		for (int k = 0; k < 20; ++k) h[std::size_t(k)] = std::uint8_t(static_cast<int>(i) * 7 + k);
++		t.set_hash(i, h);
++	}
++#ifndef TORRENT_DISABLE_MUTABLE_TORRENTS
++	t.add_similar_torrent(sha1_hash("abababababababababab"));
++	t.add_collection("collection-1");
++#endif
++	std::vector<char> buf;
++	bencode(std::back_inserter(buf), t.generate());
++	return buf;
++}
++
++std::vector<char> copy_section(torrent_info const& ti)
++{
++	auto const s = ti.info_section();
++	return {s.begin(), s.end()};
++}
++
++} // anonymous namespace
++
++TORRENT_TEST(piece_hashes_on_demand)
++{
++	std::vector<char> const buf = make_v1_torrent(5);
++	torrent_info const orig(buf, from_span);
++	std::vector<char> const section = copy_section(orig);
++
++	torrent_info ti(buf, from_span);
++	int loads = 0;
++	TEST_CHECK(ti.load_piece_hashes_on_demand([&](info_hash_t const& ih) {
++		TEST_CHECK(ih == orig.info_hashes());
++		++loads;
++		return section;
++	}, false));
++	TEST_CHECK(!ti.piece_hashes_loaded());
++	TEST_EQUAL(loads, 0);
++
++	// everything that does not need the hashes works without loading them
++	TEST_EQUAL(ti.num_files(), orig.num_files());
++	for (auto const f : orig.files().file_range())
++		TEST_EQUAL(ti.files().file_path(f), orig.files().file_path(f));
++	TEST_EQUAL(ti.name(), orig.name());
++	TEST_CHECK(ti.info_hashes() == orig.info_hashes());
++#ifndef TORRENT_DISABLE_MUTABLE_TORRENTS
++	TEST_CHECK(ti.similar_torrents() == orig.similar_torrents());
++	TEST_CHECK(ti.collections() == orig.collections());
++#endif
++	TEST_CHECK(ti.info("name"));
++	TEST_EQUAL(loads, 0);
++
++	for (auto const p : orig.piece_range())
++		TEST_EQUAL(ti.hash_for_piece(p), orig.hash_for_piece(p));
++	TEST_EQUAL(loads, 1);
++	TEST_CHECK(ti.piece_hashes_loaded());
++	TEST_CHECK(copy_section(ti) == section);
++	TEST_EQUAL(sha1_hash(ti.hash_for_piece_ptr(piece_index_t(2))), orig.hash_for_piece(piece_index_t(2)));
++	TEST_EQUAL(loads, 1);
++
++	// copies share the loaded hashes
++	torrent_info const copy(ti);
++	TEST_CHECK(copy.piece_hashes_loaded());
++
++	// not idle long enough
++	TEST_CHECK(!ti.release_unused_piece_hashes(lt::seconds(60)));
++	TEST_CHECK(ti.release_unused_piece_hashes(lt::seconds(0)));
++	TEST_CHECK(!ti.piece_hashes_loaded());
++	TEST_CHECK(!copy.piece_hashes_loaded());
++	TEST_CHECK(!ti.release_unused_piece_hashes(lt::seconds(0)));
++
++	TEST_EQUAL(copy.hash_for_piece(piece_index_t(1)), orig.hash_for_piece(piece_index_t(1)));
++	TEST_EQUAL(loads, 2);
++	TEST_CHECK(ti.piece_hashes_loaded());
++
++	// can only be done once
++	TEST_CHECK(!ti.load_piece_hashes_on_demand([&](info_hash_t const&) { return section; }, false));
++}
++
++TORRENT_TEST(piece_hashes_on_demand_keep_loaded)
++{
++	std::vector<char> const buf = make_v1_torrent(1);
++	torrent_info const orig(buf, from_span);
++	torrent_info ti(buf, from_span);
++	int loads = 0;
++	TEST_CHECK(ti.load_piece_hashes_on_demand([&](info_hash_t const&) {
++		++loads;
++		return std::vector<char>();
++	}, true));
++	TEST_CHECK(ti.piece_hashes_loaded());
++	TEST_CHECK(copy_section(ti) == copy_section(orig));
++	TEST_EQUAL(ti.hash_for_piece(piece_index_t(0)), orig.hash_for_piece(piece_index_t(0)));
++	TEST_EQUAL(loads, 0);
++	TEST_CHECK(ti.release_unused_piece_hashes(lt::seconds(0)));
++	TEST_EQUAL(ti.name(), orig.name());
++}
++
++TORRENT_TEST(piece_hashes_on_demand_bad_loader)
++{
++	std::vector<char> const buf = make_v1_torrent(2);
++	torrent_info const orig(buf, from_span);
++	std::vector<char> wrong = copy_section(orig);
++	// same size, different content: fails the info-hash check
++	wrong[wrong.size() - 30] ^= 1;
++
++	for (auto const& result : {std::vector<char>(), wrong})
++	{
++		torrent_info ti(buf, from_span);
++		TEST_CHECK(ti.load_piece_hashes_on_demand([&](info_hash_t const&) { return result; }, false));
++		TEST_THROW(ti.hash_for_piece(piece_index_t(0)));
++		TEST_THROW(ti.info_section());
++		TEST_CHECK(!ti.piece_hashes_loaded());
++	}
++}
++
++TORRENT_TEST(piece_hashes_on_demand_v2_unsupported)
++{
++	auto const loader = [](info_hash_t const&) { return std::vector<char>(); };
++	{
++		torrent_info ti(combine_path(parent_path(current_working_directory())
++			, combine_path("test_torrents", "v2_hybrid.torrent")));
++		TEST_CHECK(ti.info_hashes().has_v2());
++		TEST_CHECK(!ti.load_piece_hashes_on_demand(loader, false));
++		TEST_CHECK(ti.piece_hashes_loaded());
++	}
++	{
++		torrent_info ti(make_v1_torrent(2), from_span);
++		TEST_CHECK(!ti.load_piece_hashes_on_demand(info_section_loader(), false));
++	}
++}
++
++TORRENT_TEST(piece_hashes_on_demand_backoff)
++{
++	std::vector<char> const buf = make_v1_torrent(1);
++	torrent_info const orig(buf, from_span);
++	std::vector<char> const section = copy_section(orig);
++	torrent_info ti(buf, from_span);
++	TEST_CHECK(ti.load_piece_hashes_on_demand([&](info_hash_t const&) { return section; }, false));
++
++	// hashes used within the idle time are kept
++	ti.hash_for_piece(piece_index_t(0));
++	TEST_CHECK(!ti.release_unused_piece_hashes(lt::hours(1)));
++
++	// a release with no idle time is never premature, so reloading right away
++	// does not back off: repeated cycles keep releasing
++	for (int i = 0; i < 8; ++i)
++	{
++		TEST_CHECK(ti.release_unused_piece_hashes(lt::seconds(0)));
++		TEST_EQUAL(ti.hash_for_piece(piece_index_t(0)), orig.hash_for_piece(piece_index_t(0)));
++	}
++
++	// released after 50 ms of idle time and needed again right away: the next
++	// release needs at least 100 ms
++	std::this_thread::sleep_for(lt::milliseconds(60));
++	TEST_CHECK(ti.release_unused_piece_hashes(lt::milliseconds(50)));
++	ti.hash_for_piece(piece_index_t(0));
++	std::this_thread::sleep_for(lt::milliseconds(60));
++	TEST_CHECK(!ti.release_unused_piece_hashes(lt::milliseconds(50)));
++	std::this_thread::sleep_for(lt::milliseconds(60));
++	TEST_CHECK(ti.release_unused_piece_hashes(lt::milliseconds(50)));
++}
++
++TORRENT_TEST(piece_hashes_on_demand_size)
++{
++	std::vector<char> const buf = make_v1_torrent(3);
++	torrent_info const orig(buf, from_span);
++	torrent_info ti(buf, from_span);
++	TEST_CHECK(ti.load_piece_hashes_on_demand([](info_hash_t const&) { return std::vector<char>(); }, false));
++	TEST_EQUAL(ti.info_section_size(), int(orig.info_section().size()));
++	TEST_EQUAL(orig.info_section_size(), int(orig.info_section().size()));
++	TEST_CHECK(!ti.piece_hashes_loaded());
++}
+-- 
+2.47.3
+

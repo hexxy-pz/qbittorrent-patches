@@ -1,0 +1,1778 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anonymous <anonymous@localhost>
+Date: Fri, 02 Oct 2026 04:45:23 +0000
+Subject: [PATCH 2/4] trackers: per-tracker HTTP queues, down-tracker
+ detection, pooled curl transport
+
+HTTP(S) announces and scrapes went through one global FIFO limited by
+max_concurrent_http_announces, each on its own connection with
+"Connection: close". A slow or unreachable tracker held slots until its
+requests timed out, and every other tracker's requests waited behind it.
+
+tracker_manager now queues HTTP requests per tracker (scheme, host, port,
+local address) and starts them round-robin between trackers. The number
+in flight per tracker adapts: it starts at 4, grows by one per success
+while requests are waiting (by about one per round trip after the first
+failure), halves on failure, and is capped by
+tracker_host_max_concurrency. "stopped" announces may use up to
+tracker_stopped_concurrency. After tracker_failure_threshold failures in
+a row (connect, TLS, timeout, HTTP 5xx) a tracker is treated as down:
+its requests fail right away, and one request at a time is let through
+after a back-off (10 s, doubling up to 5 minutes).
+
+With -Dcurl-trackers=ON and tracker_http_pool (default on), requests go
+through libcurl's multi interface on the network thread: connections are
+kept alive and reused per tracker, and HTTP/2 is negotiated where the
+tracker offers it (tracker_http2), multiplexing requests over one
+connection. Name resolution, SSRF mitigation, the IP filter and listen
+socket routing stay in libtorrent; curl only connects to the filtered
+addresses, and redirects are followed by libtorrent. A SOCKS4, SOCKS5 or
+HTTP tracker proxy is used by curl as well (connections stay pooled
+through it); names are resolved and filtered by libtorrent as before,
+except with SOCKS5 and proxy_hostnames, where the proxy resolves them.
+i2p keeps using http_connection.
+
+Requests wait in their tracker's queue (also while it is down) for at most
+tracker_queue_timeout seconds; then they fail and the torrent retries on its
+own schedule. A queued request whose listen socket closed (the listen port or
+interfaces changed) is dropped, and a tracker's queue holds at most
+tracker_host_max_queue requests.
+
+New settings: tracker_http_pool, tracker_http2,
+tracker_host_max_concurrency (32), tracker_host_max_streams (250),
+tracker_stopped_concurrency (256), tracker_failure_threshold (5),
+tracker_connect_timeout (10), tracker_queue_timeout (600),
+tracker_host_max_queue (20000).
+---
+ CMakeLists.txt                                |   8 +
+ .../aux_/curl_tracker_transport.hpp           | 103 +++++
+ include/libtorrent/config.hpp                 |   5 +
+ .../libtorrent/http_tracker_connection.hpp    |  42 ++
+ include/libtorrent/settings_pack.hpp          |  48 ++
+ include/libtorrent/tracker_manager.hpp        |  79 +++-
+ src/curl_tracker_transport.cpp                | 413 ++++++++++++++++++
+ src/http_tracker_connection.cpp               | 303 ++++++++++++-
+ src/settings_pack.cpp                         |  11 +-
+ src/tracker_manager.cpp                       | 397 +++++++++++++++--
+ 10 files changed, 1350 insertions(+), 59 deletions(-)
+ create mode 100644 include/libtorrent/aux_/curl_tracker_transport.hpp
+ create mode 100644 src/curl_tracker_transport.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index a07532b85..8612a1e07 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -191,6 +191,7 @@ set(libtorrent_extensions_include_files
+ )
+ 
+ set(libtorrent_aux_include_files
++	curl_tracker_transport.hpp
+ 	alert_manager.hpp
+ 	aligned_union.hpp
+ 	alloca.hpp
+@@ -410,6 +411,7 @@ set(sources
+ 	torrent_peer_allocator.cpp
+ 	torrent_status.cpp
+ 	tracker_manager.cpp
++	curl_tracker_transport.cpp
+ 	truncate.cpp
+ 	udp_socket.cpp
+ 	udp_tracker_connection.cpp
+@@ -711,6 +713,12 @@ target_optional_compile_definitions(torrent-rasterbar PUBLIC FEATURE NAME deprec
+ feature_option(encryption "Enables encryption in libtorrent" ON)
+ feature_option(exceptions "build with exception support" ON)
+ feature_option(gnutls "build using GnuTLS instead of OpenSSL" OFF)
++feature_option(curl-trackers "use libcurl for HTTP(S) tracker requests (kept-alive connections, HTTP/2)" OFF)
++if(curl-trackers)
++	find_package(CURL REQUIRED)
++	target_link_libraries(torrent-rasterbar PRIVATE CURL::libcurl)
++	target_compile_definitions(torrent-rasterbar PUBLIC TORRENT_USE_CURL=1)
++endif()
+ target_optional_compile_definitions(torrent-rasterbar PUBLIC FEATURE NAME extensions DEFAULT ON
+ 	DESCRIPTION "Enables protocol extensions" DISABLED TORRENT_DISABLE_EXTENSIONS)
+ target_optional_compile_definitions(torrent-rasterbar PUBLIC FEATURE NAME i2p DEFAULT ON
+diff --git a/include/libtorrent/aux_/curl_tracker_transport.hpp b/include/libtorrent/aux_/curl_tracker_transport.hpp
+new file mode 100644
+index 000000000..0fd7eb181
+--- /dev/null
++++ b/include/libtorrent/aux_/curl_tracker_transport.hpp
+@@ -0,0 +1,103 @@
++/*
++
++You may use, distribute and modify this code under the terms of the BSD license,
++see LICENSE file.
++*/
++
++#ifndef TORRENT_CURL_TRACKER_TRANSPORT_HPP_INCLUDED
++#define TORRENT_CURL_TRACKER_TRANSPORT_HPP_INCLUDED
++
++#include "libtorrent/config.hpp"
++
++#if TORRENT_USE_CURL
++
++#include "libtorrent/address.hpp"
++#include "libtorrent/error_code.hpp"
++#include "libtorrent/io_context.hpp"
++
++#include <cstdint>
++#include <functional>
++#include <memory>
++#include <string>
++#include <vector>
++
++namespace libtorrent {
++namespace aux {
++
++	// One HTTP(S) tracker request for curl_tracker_transport. Name resolution and endpoint
++	// filtering (SSRF mitigation, IP filter, listen socket routing) stay in
++	// http_tracker_connection; curl only connects to the addresses given here.
++	struct curl_tracker_request
++	{
++		std::string url;
++		std::string host;
++		int port = 0;
++		std::vector<address> addresses;
++		std::string user_agent;
++		// bind to this device and/or local address, like http_connection does
++		std::string bind_device;
++		address bind_address;
++		int timeout_ms = 30000;
++		int connect_timeout_ms = 10000;
++		bool verify_tls = true;
++		bool http2 = true;
++		// proxy URL for curl (socks4://, socks5://, socks5h://, http://host:port); "" = none,
++		// which also ignores proxies set in the environment
++		std::string proxy;
++		std::string proxy_username;
++		std::string proxy_password;
++		std::size_t max_response_size = 4 * 1024 * 1024;
++	};
++
++	struct curl_tracker_response
++	{
++		// set when no complete HTTP response was received
++		error_code ec;
++		std::string error_message;
++		int status = 0;
++		std::string reason;
++		// the header fields of the final response, "name: value\r\n" each
++		std::string headers;
++		std::vector<char> body;
++		// the address the request went to
++		address peer;
++		// 11 for HTTP/1.1, 20 for HTTP/2
++		int http_version = 0;
++		// true if the request reused an existing connection
++		bool reused = false;
++	};
++
++	// Runs libcurl's multi interface on libtorrent's network thread. Connections (and HTTP/2
++	// sessions) are pooled and reused per host; requests to one host can only queue behind
++	// requests to the same host (tracker_manager decides how many run at once per host).
++	struct TORRENT_EXTRA_EXPORT curl_tracker_transport
++	{
++		using handler_t = std::function<void(curl_tracker_response)>;
++
++		explicit curl_tracker_transport(io_context& ios);
++		~curl_tracker_transport();
++		curl_tracker_transport(curl_tracker_transport const&) = delete;
++		curl_tracker_transport& operator=(curl_tracker_transport const&) = delete;
++
++		// false if libcurl could not be initialized; callers fall back to http_connection
++		bool valid() const;
++
++		// starts the request; the handler is called exactly once, on the network thread,
++		// unless the request is cancelled first. Returns an id for cancel()
++		std::uint64_t perform(curl_tracker_request const& req, handler_t h);
++
++		// abort a request; its handler is not called
++		void cancel(std::uint64_t id);
++
++		// abort everything and drop all pooled connections
++		void close();
++
++		struct impl;
++	private:
++		std::shared_ptr<impl> m_impl;
++	};
++}
++}
++
++#endif // TORRENT_USE_CURL
++#endif
+diff --git a/include/libtorrent/config.hpp b/include/libtorrent/config.hpp
+index 3d0fb5d7c..d48098f7e 100644
+--- a/include/libtorrent/config.hpp
++++ b/include/libtorrent/config.hpp
+@@ -668,6 +668,11 @@ POSSIBILITY OF SUCH DAMAGE.
+ #define TORRENT_USE_SSL 0
+ #endif
+ 
++// HTTP(S) tracker requests through libcurl (see aux_/curl_tracker_transport.hpp)
++#ifndef TORRENT_USE_CURL
++#define TORRENT_USE_CURL 0
++#endif
++
+ #if defined TORRENT_SSL_PEERS && !TORRENT_USE_SSL
+ #error compiling with TORRENT_SSL_PEERS requires TORRENT_USE_OPENSSL or TORRENT_USE_GNUTLS
+ #endif
+diff --git a/include/libtorrent/http_tracker_connection.hpp b/include/libtorrent/http_tracker_connection.hpp
+index 0c775af22..abb2e64ff 100644
+--- a/include/libtorrent/http_tracker_connection.hpp
++++ b/include/libtorrent/http_tracker_connection.hpp
+@@ -41,6 +41,7 @@ POSSIBILITY OF SUCH DAMAGE.
+ #include "libtorrent/peer_id.hpp"
+ #include "libtorrent/error_code.hpp"
+ #include "libtorrent/tracker_manager.hpp" // for tracker_connection
++#include "libtorrent/aux_/resolver_interface.hpp"
+ 
+ namespace libtorrent {
+ 
+@@ -81,9 +82,50 @@ namespace libtorrent {
+ 
+ 		void on_timeout(error_code const&) override {}
+ 
++		// false if it called fail()
++		bool filter_endpoints(std::string const& url, std::vector<tcp::endpoint>& endpoints);
++		void report_outcome(error_code const& ec, int status);
++
+ 		std::shared_ptr<http_connection> m_tracker_connection;
+ 		address m_tracker_ip;
+ 		io_context& m_ioc;
++
++		// set by tracker_manager: which per-tracker queue this request belongs to
++		std::string m_host_key;
++		// set by tracker_manager: when it was queued, and whether it goes out of
++		// a listen socket (a queued request whose socket closed is dropped)
++		time_point m_queued_at;
++		bool m_has_socket = false;
++		// the requester (torrent) when queued, for tracker_manager::key_of()
++		void const* m_order_requester = nullptr;
++		// for tracker_manager's per-tracker limits: whether the tracker answered
++		enum class outcome : std::uint8_t { none, success, failure };
++		outcome m_outcome = outcome::none;
++		// the response came over HTTP/2
++		bool m_http2 = false;
++		bool m_closed = false;
++
++#if TORRENT_USE_CURL
++		void start_curl();
++		void on_curl_resolved(error_code const& ec, std::vector<address> const& addresses);
++		void on_curl_done(aux::curl_tracker_response resp);
++
++		std::uint64_t m_curl_id = 0;
++		std::string m_url;
++		std::vector<tcp::endpoint> m_endpoints;
++		std::string m_user_agent;
++		std::string m_bind_device;
++		address m_bind_address;
++		int m_timeout = 30;
++		aux::resolver_flags m_resolver_flags;
++		int m_redirects = 0;
++		// the tracker proxy as a curl proxy URL ("" = none) and its login
++		std::string m_proxy;
++		std::string m_proxy_username;
++		std::string m_proxy_password;
++		// the proxy resolves the tracker's name (socks5 with proxy_hostnames)
++		bool m_proxy_resolves = false;
++#endif
+ 	};
+ 
+ 	TORRENT_EXTRA_EXPORT tracker_response parse_tracker_response(
+diff --git a/include/libtorrent/settings_pack.hpp b/include/libtorrent/settings_pack.hpp
+index caec0e234..adfd38800 100644
+--- a/include/libtorrent/settings_pack.hpp
++++ b/include/libtorrent/settings_pack.hpp
+@@ -1070,6 +1070,16 @@ namespace aux {
+ 			// increase network load.
+ 			allow_multiple_connections_per_pid,
+ 
++			// when true (and libtorrent is built with libcurl), HTTP(S) tracker
++			// announces and scrapes go through a pool of kept-alive connections per
++			// tracker host instead of one connection per request, also through a
++			// SOCKS4/SOCKS5/HTTP proxy. Requests to i2p trackers always use the old path.
++			tracker_http_pool,
++
++			// when true, the pooled transport negotiates HTTP/2 with HTTPS trackers
++			// that support it and multiplexes requests over one connection.
++			tracker_http2,
++
+ 			max_bool_setting_internal
+ 		};
+ 
+@@ -2160,6 +2170,44 @@ namespace aux {
+ 			// seconds.
+ 			natpmp_lease_duration,
+ 
++			// the most HTTP tracker requests that may run at the same time against
++			// one tracker (scheme, host and port). The actual limit per tracker
++			// starts low, grows while requests queue up and succeed, and halves on
++			// failures. ``max_concurrent_http_announces`` still limits the total.
++			tracker_host_max_concurrency,
++
++			// like tracker_host_max_concurrency, for trackers that answered over
++			// HTTP/2: requests are streams multiplexed over one connection there,
++			// so more of them can run at once. ``stopped`` announces to such
++			// trackers are only limited by ``max_concurrent_http_announces``.
++			tracker_host_max_streams,
++
++			// the most ``stopped`` announces that may run at the same time against
++			// one tracker. Stopped announces are sent when torrents stop and at
++			// shutdown, where ``stop_tracker_timeout`` limits how long they may take.
++			tracker_stopped_concurrency,
++
++			// after this many requests to a tracker fail in a row (connect or TLS
++			// failure, timeout, or an HTTP 5xx), the tracker is considered down:
++			// its requests wait in its queue without taking slots, one request at a
++			// time is let through after a back-off (10 seconds, doubling up to 30
++			// seconds) to find out when it is back, and then the waiting requests go
++			// out. ``stopped`` announces to a tracker that is down fail right away.
++			tracker_failure_threshold,
++
++			// seconds to wait for the TCP (and TLS) connection to a tracker before
++			// the request fails. Only used by the pooled transport.
++			tracker_connect_timeout,
++
++			// seconds an HTTP tracker request may wait in its tracker's queue
++			// (including while the tracker is down) before it fails with a
++			// timeout, and the torrent retries on its own schedule.
++			tracker_queue_timeout,
++
++			// the most HTTP tracker requests that may wait in one tracker's queue;
++			// more fail right away.
++			tracker_host_max_queue,
++
+ 			max_int_setting_internal
+ 		};
+ 
+diff --git a/include/libtorrent/tracker_manager.hpp b/include/libtorrent/tracker_manager.hpp
+index 97c8bc086..af752e795 100644
+--- a/include/libtorrent/tracker_manager.hpp
++++ b/include/libtorrent/tracker_manager.hpp
+@@ -64,6 +64,15 @@ POSSIBILITY OF SUCH DAMAGE.
+ #include "libtorrent/debug.hpp"
+ #include "libtorrent/error_code.hpp"
+ #include "libtorrent/aux_/listen_socket_handle.hpp"
++#include "libtorrent/time.hpp"
++#include "libtorrent/deadline_timer.hpp"
++#if TORRENT_USE_CURL
++#include "libtorrent/aux_/curl_tracker_transport.hpp"
++#endif
++#include <map>
++#include <set>
++#include <tuple>
++#include <memory>
+ #include "libtorrent/udp_socket.hpp"
+ #include "libtorrent/aux_/session_settings.hpp"
+ #include "libtorrent/ssl.hpp"
+@@ -394,6 +403,12 @@ enum class event_t : std::uint8_t
+ 		aux::session_settings const& settings() const { return m_settings; }
+ 		aux::resolver_interface& host_resolver() { return m_host_resolver; }
+ 
++#if TORRENT_USE_CURL
++		// the pooled HTTP(S) transport, created on first use; nullptr if libcurl is unusable
++		aux::curl_tracker_transport* curl_transport(io_context& ios);
++		aux::curl_tracker_transport* curl_transport() { return m_curl.get(); }
++#endif
++
+ 		void send_hostname(aux::listen_socket_handle const& sock
+ 			, char const* hostname, int port, span<char const> p
+ 			, error_code& ec, udp_send_flags_t flags = {});
+@@ -409,8 +424,70 @@ enum class event_t : std::uint8_t
+ 		// if a connection is erased while a timeout event is in the queue
+ 		std::unordered_map<std::uint32_t, std::shared_ptr<udp_tracker_connection>> m_udp_conns;
+ 
++		// HTTP(S) requests that are running
+ 		std::vector<std::shared_ptr<http_tracker_connection>> m_http_conns;
+-		std::deque<std::shared_ptr<http_tracker_connection>> m_queued;
++
++		// HTTP(S) requests are queued and limited per tracker (scheme, host, port and
++		// local address), so a slow or unreachable tracker only holds back its own
++		// requests. The limit per tracker adapts: it starts at a few requests, grows by
++		// one per success while requests are waiting (doubling per round trip until the
++		// first failure, then by about one per round trip), and halves on failure.
++		// After tracker_failure_threshold failures in a row the tracker is considered
++		// down: its requests are held in its queue (they take no slots), one request
++		// at a time is let through after a back-off (10 s, doubling up to 30 s) to find
++		// out whether it is back, and once one gets through all held requests go out.
++		// "stopped" requests to a tracker that is down fail right away.
++		// a torrent's announce session with one tracker: requests with the same key
++		// go out one at a time, in the order they were made (a stale announce
++		// arriving after a newer one would corrupt the tracker's statistics)
++		using order_key = std::tuple<void const*, aux::listen_socket_handle, sha1_hash>;
++		static order_key key_of(http_tracker_connection const& c);
++		static void unqueue_key(std::multiset<order_key>& keys, order_key const& k);
++
++		struct http_host
++		{
++			std::deque<std::shared_ptr<http_tracker_connection>> queue;
++			// keys of the requests in flight, and of the requests in the queue
++			std::set<order_key> inflight_keys;
++			std::multiset<order_key> queued_keys;
++			int inflight = 0;
++			double limit = 4;
++			bool slow_start = true;
++			int failures = 0;
++			bool down = false;
++			bool probing = false;
++			// the request let through to test a tracker that is down
++			http_tracker_connection const* probe = nullptr;
++			// the tracker answered over HTTP/2: requests share a connection
++			bool multiplexed = false;
++			// high priority requests were put in front of the queue, so it is not
++			// in arrival order (reset when the queue runs empty)
++			bool unordered = false;
++			time_point retry_at;
++			seconds32 backoff{10};
++		};
++		void arm_http_timer();
++		io_context* m_ios = nullptr;
++		std::unique_ptr<deadline_timer> m_http_timer;
++		time_point m_http_timer_at = max_time();
++		std::shared_ptr<bool> m_alive = std::make_shared<bool>(true);
++		std::map<std::string, http_host> m_http_hosts;
++		// the host that last started a request, for round-robin between hosts
++		std::string m_http_cursor;
++
++		void dispatch_http();
++		// fails queued requests that waited longer than tracker_queue_timeout or
++		// whose listen socket closed. At most every few seconds unless forced
++		void expire_http_queue(bool force);
++		time_point m_next_queue_scan = min_time();
++		void http_request_done(http_tracker_connection const& c);
++		void fail_down(std::shared_ptr<http_tracker_connection> const& c, http_host const& h, std::string const& key);
++		int num_queued_http() const;
++
++#if TORRENT_USE_CURL
++		std::unique_ptr<aux::curl_tracker_transport> m_curl;
++		bool m_curl_tried = false;
++#endif
+ 
+ 		send_fun_t m_send_fun;
+ 		send_fun_hostname_t m_send_fun_hostname;
+diff --git a/src/curl_tracker_transport.cpp b/src/curl_tracker_transport.cpp
+new file mode 100644
+index 000000000..c7265d32d
+--- /dev/null
++++ b/src/curl_tracker_transport.cpp
+@@ -0,0 +1,413 @@
++/*
++
++You may use, distribute and modify this code under the terms of the BSD license,
++see LICENSE file.
++*/
++
++#include "libtorrent/config.hpp"
++
++#if TORRENT_USE_CURL
++
++#include "libtorrent/aux_/curl_tracker_transport.hpp"
++#include "libtorrent/error.hpp"
++#include "libtorrent/assert.hpp"
++
++#include "libtorrent/aux_/disable_warnings_push.hpp"
++#include <boost/asio/posix/stream_descriptor.hpp>
++#include <boost/asio/steady_timer.hpp>
++#include <boost/asio/post.hpp>
++#include <curl/curl.h>
++#include "libtorrent/aux_/disable_warnings_pop.hpp"
++
++#include <chrono>
++#include <cstring>
++#include <mutex>
++#include <unordered_map>
++
++namespace libtorrent {
++namespace aux {
++
++namespace {
++
++	error_code map_curl_error(CURLcode const c)
++	{
++		switch (c)
++		{
++			case CURLE_OPERATION_TIMEDOUT: return errors::timed_out;
++			case CURLE_COULDNT_RESOLVE_HOST:
++			case CURLE_COULDNT_RESOLVE_PROXY: return boost::asio::error::host_not_found;
++			case CURLE_COULDNT_CONNECT: return boost::asio::error::connection_refused;
++			// the proxy refused or could not reach the tracker (the message says which)
++			case CURLE_PROXY: return boost::asio::error::network_unreachable;
++			case CURLE_GOT_NOTHING:
++			case CURLE_PARTIAL_FILE:
++			case CURLE_RECV_ERROR: return boost::asio::error::eof;
++			case CURLE_SEND_ERROR: return boost::asio::error::connection_reset;
++			case CURLE_WRITE_ERROR:
++			case CURLE_FILESIZE_EXCEEDED: return boost::asio::error::message_size;
++			case CURLE_SSL_CONNECT_ERROR:
++			case CURLE_PEER_FAILED_VERIFICATION:
++			case CURLE_SSL_CERTPROBLEM:
++			case CURLE_SSL_CIPHER:
++			case CURLE_SSL_CACERT_BADFILE:
++			case CURLE_SSL_ISSUER_ERROR: return boost::asio::error::no_protocol_option;
++			default: return boost::asio::error::fault;
++		}
++	}
++
++	std::once_flag curl_init_once;
++	bool curl_init_ok = false;
++}
++
++	struct curl_tracker_transport::impl : std::enable_shared_from_this<impl>
++	{
++		explicit impl(io_context& ios) : m_ios(ios), m_timer(ios) {}
++
++		struct request
++		{
++			std::uint64_t id = 0;
++			CURL* easy = nullptr;
++			curl_slist* resolve = nullptr;
++			curl_slist* headers = nullptr;
++			handler_t handler;
++			curl_tracker_response response;
++			std::size_t max_size = 0;
++			char error_buf[CURL_ERROR_SIZE] = {};
++		};
++
++		struct watch
++		{
++			explicit watch(io_context& ios) : desc(ios) {}
++			boost::asio::posix::stream_descriptor desc;
++			int what = 0;
++			bool reading = false;
++			bool writing = false;
++			std::uint64_t generation = 0;
++		};
++
++		bool init()
++		{
++			std::call_once(curl_init_once, [] { curl_init_ok = curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK; });
++			if (!curl_init_ok) return false;
++			m_multi = curl_multi_init();
++			if (m_multi == nullptr) return false;
++			curl_multi_setopt(m_multi, CURLMOPT_SOCKETFUNCTION, &impl::socket_cb);
++			curl_multi_setopt(m_multi, CURLMOPT_SOCKETDATA, this);
++			curl_multi_setopt(m_multi, CURLMOPT_TIMERFUNCTION, &impl::timer_cb);
++			curl_multi_setopt(m_multi, CURLMOPT_TIMERDATA, this);
++			// multiplex HTTP/2 streams over one connection per host; HTTP/1.1 connections
++			// are kept alive and reused one request at a time
++			curl_multi_setopt(m_multi, CURLMOPT_PIPELINING, long(CURLPIPE_MULTIPLEX));
++			curl_multi_setopt(m_multi, CURLMOPT_MAX_CONCURRENT_STREAMS, 100L);
++			// size of the idle connection cache (across all trackers)
++			curl_multi_setopt(m_multi, CURLMOPT_MAXCONNECTS, 512L);
++			return true;
++		}
++
++		~impl()
++		{
++			close();
++			if (m_multi) curl_multi_cleanup(m_multi);
++		}
++
++		std::uint64_t perform(curl_tracker_request const& r, handler_t h)
++		{
++			auto req = std::make_unique<request>();
++			req->id = ++m_next_id;
++			req->handler = std::move(h);
++			req->max_size = r.max_response_size;
++			CURL* e = curl_easy_init();
++			if (e == nullptr)
++			{
++				curl_tracker_response resp;
++				resp.ec = boost::asio::error::no_memory;
++				resp.error_message = "curl_easy_init failed";
++				boost::asio::post(m_ios, [hh = std::move(req->handler), resp]() mutable { hh(std::move(resp)); });
++				return 0;
++			}
++			req->easy = e;
++
++			// connect only to the addresses libtorrent resolved and filtered
++			std::string pin = r.host + ":" + std::to_string(r.port) + ":";
++			for (std::size_t i = 0; i < r.addresses.size(); ++i)
++			{
++				if (i > 0) pin += ",";
++				pin += r.addresses[i].is_v6() ? "[" + r.addresses[i].to_string() + "]" : r.addresses[i].to_string();
++			}
++			// a literal IP in the URL needs no pinning
++			if (!r.addresses.empty()) req->resolve = curl_slist_append(nullptr, pin.c_str());
++			// same request headers as http_connection (minus "Connection: close"): no "Accept"
++			req->headers = curl_slist_append(nullptr, "Accept:");
++
++			curl_easy_setopt(e, CURLOPT_URL, r.url.c_str());
++			if (req->resolve) curl_easy_setopt(e, CURLOPT_RESOLVE, req->resolve);
++			curl_easy_setopt(e, CURLOPT_HTTPHEADER, req->headers);
++			curl_easy_setopt(e, CURLOPT_PROTOCOLS_STR, "http,https");
++			curl_easy_setopt(e, CURLOPT_FOLLOWLOCATION, 0L);
++			curl_easy_setopt(e, CURLOPT_NOSIGNAL, 1L);
++			curl_easy_setopt(e, CURLOPT_ACCEPT_ENCODING, "gzip");
++			if (!r.user_agent.empty()) curl_easy_setopt(e, CURLOPT_USERAGENT, r.user_agent.c_str());
++			curl_easy_setopt(e, CURLOPT_HTTP_VERSION, r.http2 ? long(CURL_HTTP_VERSION_2TLS) : long(CURL_HTTP_VERSION_1_1));
++			// wait for an HTTP/2 connection that is being set up rather than opening another one
++			if (r.http2) curl_easy_setopt(e, CURLOPT_PIPEWAIT, 1L);
++			curl_easy_setopt(e, CURLOPT_TIMEOUT_MS, long(r.timeout_ms));
++			curl_easy_setopt(e, CURLOPT_CONNECTTIMEOUT_MS, long(std::min(r.timeout_ms, r.connect_timeout_ms)));
++			curl_easy_setopt(e, CURLOPT_MAXAGE_CONN, 120L);
++			curl_easy_setopt(e, CURLOPT_SSL_VERIFYPEER, r.verify_tls ? 1L : 0L);
++			curl_easy_setopt(e, CURLOPT_SSL_VERIFYHOST, r.verify_tls ? 2L : 0L);
++			// connections are cached per proxy, so a proxy change never reuses one made without it
++			curl_easy_setopt(e, CURLOPT_PROXY, r.proxy.c_str());
++			if (!r.proxy.empty() && !r.proxy_username.empty())
++			{
++				curl_easy_setopt(e, CURLOPT_PROXYUSERNAME, r.proxy_username.c_str());
++				curl_easy_setopt(e, CURLOPT_PROXYPASSWORD, r.proxy_password.c_str());
++			}
++			std::string iface;
++			if (!r.bind_device.empty()) iface = "if!" + r.bind_device;
++			else if (!r.bind_address.is_unspecified()) iface = "host!" + r.bind_address.to_string();
++			if (!iface.empty()) curl_easy_setopt(e, CURLOPT_INTERFACE, iface.c_str());
++			curl_easy_setopt(e, CURLOPT_HEADERFUNCTION, &impl::header_cb);
++			curl_easy_setopt(e, CURLOPT_HEADERDATA, req.get());
++			curl_easy_setopt(e, CURLOPT_WRITEFUNCTION, &impl::write_cb);
++			curl_easy_setopt(e, CURLOPT_WRITEDATA, req.get());
++			curl_easy_setopt(e, CURLOPT_ERRORBUFFER, req->error_buf);
++			curl_easy_setopt(e, CURLOPT_PRIVATE, req.get());
++
++			std::uint64_t const id = req->id;
++			m_requests.emplace(id, std::move(req));
++			if (curl_multi_add_handle(m_multi, e) != CURLM_OK)
++			{
++				auto it = m_requests.find(id);
++				curl_tracker_response resp;
++				resp.ec = boost::asio::error::fault;
++				resp.error_message = "curl_multi_add_handle failed";
++				handler_t hh = std::move(it->second->handler);
++				destroy(*it->second, false);
++				m_requests.erase(it);
++				boost::asio::post(m_ios, [hh = std::move(hh), resp]() mutable { hh(std::move(resp)); });
++				return 0;
++			}
++			return id;
++		}
++
++		void cancel(std::uint64_t const id)
++		{
++			auto it = m_requests.find(id);
++			if (it == m_requests.end()) return;
++			destroy(*it->second, true);
++			m_requests.erase(it);
++		}
++
++		void close()
++		{
++			for (auto& r : m_requests) destroy(*r.second, true);
++			m_requests.clear();
++			m_timer.cancel();
++		}
++
++		void destroy(request& r, bool const in_multi)
++		{
++			if (r.easy)
++			{
++				if (in_multi) curl_multi_remove_handle(m_multi, r.easy);
++				curl_easy_cleanup(r.easy);
++				r.easy = nullptr;
++			}
++			curl_slist_free_all(r.resolve);
++			curl_slist_free_all(r.headers);
++			r.resolve = r.headers = nullptr;
++		}
++
++		static size_t header_cb(char* data, size_t size, size_t n, void* userp)
++		{
++			auto* r = static_cast<request*>(userp);
++			std::string line(data, size * n);
++			// a new status line starts the headers of the next (final) response
++			if (line.compare(0, 5, "HTTP/") == 0)
++			{
++				r->response.headers.clear();
++				auto const sp1 = line.find(' ');
++				auto const sp2 = sp1 == std::string::npos ? sp1 : line.find(' ', sp1 + 1);
++				r->response.reason = sp2 == std::string::npos ? std::string()
++					: line.substr(sp2 + 1, line.find_last_not_of("\r\n") - sp2);
++				return size * n;
++			}
++			if (line != "\r\n" && line != "\n") r->response.headers += line;
++			return size * n;
++		}
++
++		static size_t write_cb(char* data, size_t size, size_t n, void* userp)
++		{
++			auto* r = static_cast<request*>(userp);
++			if (r->response.body.size() + size * n > r->max_size) return 0;
++			r->response.body.insert(r->response.body.end(), data, data + size * n);
++			return size * n;
++		}
++
++		static int timer_cb(CURLM*, long const timeout_ms, void* userp)
++		{
++			auto* self = static_cast<impl*>(userp);
++			self->m_timer.cancel();
++			if (timeout_ms < 0) return 0;
++			// also called from curl_multi_remove_handle() while ~impl runs: no shared_from_this()
++			std::weak_ptr<impl> weak = self->weak_from_this();
++			if (weak.expired()) return 0;
++			self->m_timer.expires_after(std::chrono::milliseconds(timeout_ms));
++			self->m_timer.async_wait([weak](error_code const& ec)
++			{
++				if (ec) return;
++				auto s = weak.lock();
++				if (!s) return;
++				int running = 0;
++				curl_multi_socket_action(s->m_multi, CURL_SOCKET_TIMEOUT, 0, &running);
++				s->check_done();
++			});
++			return 0;
++		}
++
++		static int socket_cb(CURL*, curl_socket_t const fd, int const what, void* userp, void*)
++		{
++			auto* self = static_cast<impl*>(userp);
++			if (what == CURL_POLL_REMOVE)
++			{
++				auto it = self->m_watches.find(fd);
++				if (it != self->m_watches.end())
++				{
++					error_code ec;
++					it->second->desc.cancel(ec);
++					// the descriptor belongs to curl: release, never close
++					it->second->desc.release();
++					self->m_watches.erase(it);
++				}
++				return 0;
++			}
++			auto it = self->m_watches.find(fd);
++			if (it == self->m_watches.end())
++			{
++				auto w = std::make_unique<watch>(self->m_ios);
++				error_code ec;
++				w->desc.assign(fd, ec);
++				if (ec) return -1;
++				w->generation = ++self->m_generation;
++				it = self->m_watches.emplace(fd, std::move(w)).first;
++			}
++			it->second->what = what;
++			self->arm(fd, *it->second);
++			return 0;
++		}
++
++		void arm(curl_socket_t const fd, watch& w)
++		{
++			std::weak_ptr<impl> weak = weak_from_this();
++			std::uint64_t const gen = w.generation;
++			if ((w.what & CURL_POLL_IN) && !w.reading)
++			{
++				w.reading = true;
++				w.desc.async_wait(boost::asio::posix::stream_descriptor::wait_read
++					, [weak, fd, gen](error_code const& ec) { if (auto s = weak.lock()) s->on_ready(fd, gen, CURL_CSELECT_IN, ec); });
++			}
++			if ((w.what & CURL_POLL_OUT) && !w.writing)
++			{
++				w.writing = true;
++				w.desc.async_wait(boost::asio::posix::stream_descriptor::wait_write
++					, [weak, fd, gen](error_code const& ec) { if (auto s = weak.lock()) s->on_ready(fd, gen, CURL_CSELECT_OUT, ec); });
++			}
++		}
++
++		void on_ready(curl_socket_t const fd, std::uint64_t const gen, int const dir, error_code const& ec)
++		{
++			auto it = m_watches.find(fd);
++			if (it == m_watches.end() || it->second->generation != gen) return;
++			if (dir == CURL_CSELECT_IN) it->second->reading = false;
++			else it->second->writing = false;
++			if (ec == boost::asio::error::operation_aborted) return;
++			// curl may have switched direction since this wait was armed
++			if (!ec && !(it->second->what & (dir == CURL_CSELECT_IN ? CURL_POLL_IN : CURL_POLL_OUT))) return;
++			int running = 0;
++			curl_multi_socket_action(m_multi, fd, ec ? CURL_CSELECT_ERR : dir, &running);
++			check_done();
++			// still interested in this socket: wait again
++			it = m_watches.find(fd);
++			if (it != m_watches.end() && it->second->generation == gen) arm(fd, *it->second);
++		}
++
++		void check_done()
++		{
++			std::vector<std::pair<handler_t, curl_tracker_response>> done;
++			int left = 0;
++			while (CURLMsg* msg = curl_multi_info_read(m_multi, &left))
++			{
++				if (msg->msg != CURLMSG_DONE) continue;
++				char* priv = nullptr;
++				curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, &priv);
++				auto* r = reinterpret_cast<request*>(priv);
++				if (r == nullptr) continue;
++				auto it = m_requests.find(r->id);
++				if (it == m_requests.end()) continue;
++				curl_tracker_response& resp = r->response;
++				CURLcode const res = msg->data.result;
++				long code = 0, version = 0, connects = 0;
++				char* ip = nullptr;
++				curl_easy_getinfo(r->easy, CURLINFO_RESPONSE_CODE, &code);
++				curl_easy_getinfo(r->easy, CURLINFO_HTTP_VERSION, &version);
++				curl_easy_getinfo(r->easy, CURLINFO_NUM_CONNECTS, &connects);
++				curl_easy_getinfo(r->easy, CURLINFO_PRIMARY_IP, &ip);
++				resp.status = int(code);
++				resp.http_version = version == CURL_HTTP_VERSION_2_0 ? 20 : version == CURL_HTTP_VERSION_1_0 ? 10 : 11;
++				resp.reused = connects == 0;
++				if (ip && *ip)
++				{
++					error_code aec;
++					resp.peer = make_address(ip, aec);
++				}
++				if (res != CURLE_OK)
++				{
++					resp.ec = map_curl_error(res);
++					resp.error_message = std::string("curl: ") + (r->error_buf[0] ? r->error_buf : curl_easy_strerror(res));
++				}
++				done.emplace_back(std::move(r->handler), std::move(resp));
++				destroy(*r, true);
++				m_requests.erase(it);
++			}
++			// handlers may start new requests or cancel others
++			for (auto& d : done) d.first(std::move(d.second));
++		}
++
++		io_context& m_ios;
++		CURLM* m_multi = nullptr;
++		boost::asio::steady_timer m_timer;
++		std::unordered_map<std::uint64_t, std::unique_ptr<request>> m_requests;
++		std::unordered_map<curl_socket_t, std::unique_ptr<watch>> m_watches;
++		std::uint64_t m_next_id = 0;
++		std::uint64_t m_generation = 0;
++	};
++
++	curl_tracker_transport::curl_tracker_transport(io_context& ios)
++		: m_impl(std::make_shared<impl>(ios))
++	{
++		if (!m_impl->init()) m_impl.reset();
++	}
++
++	curl_tracker_transport::~curl_tracker_transport() = default;
++
++	bool curl_tracker_transport::valid() const { return bool(m_impl); }
++
++	std::uint64_t curl_tracker_transport::perform(curl_tracker_request const& req, handler_t h)
++	{
++		TORRENT_ASSERT(m_impl);
++		return m_impl->perform(req, std::move(h));
++	}
++
++	void curl_tracker_transport::cancel(std::uint64_t const id)
++	{
++		if (m_impl && id != 0) m_impl->cancel(id);
++	}
++
++	void curl_tracker_transport::close()
++	{
++		if (m_impl) m_impl->close();
++	}
++}
++}
++
++#endif // TORRENT_USE_CURL
+diff --git a/src/http_tracker_connection.cpp b/src/http_tracker_connection.cpp
+index e836a6e96..9e1a3c04f 100644
+--- a/src/http_tracker_connection.cpp
++++ b/src/http_tracker_connection.cpp
+@@ -60,6 +60,8 @@ POSSIBILITY OF SUCH DAMAGE.
+ #include "libtorrent/aux_/resolver_interface.hpp"
+ #include "libtorrent/ip_filter.hpp"
+ #include "libtorrent/parse_url.hpp"
++#include "libtorrent/http_parser.hpp"
++#include "libtorrent/address.hpp"
+ #include "libtorrent/aux_/array.hpp"
+ 
+ namespace libtorrent {
+@@ -223,18 +225,6 @@ namespace libtorrent {
+ 			return;
+ 		}
+ 
+-		using namespace std::placeholders;
+-		m_tracker_connection = std::make_shared<http_connection>(m_ioc, m_man.host_resolver()
+-			, std::bind(&http_tracker_connection::on_response, shared_from_this(), _1, _2, _3)
+-			, true, settings.get_int(settings_pack::max_http_recv_buffer_size)
+-			, std::bind(&http_tracker_connection::on_connect, shared_from_this(), _1)
+-			, std::bind(&http_tracker_connection::on_filter, shared_from_this(), _1, _2)
+-			, std::bind(&http_tracker_connection::on_filter_hostname, shared_from_this(), _1, _2)
+-#if TORRENT_USE_SSL
+-			, tracker_req().ssl_ctx
+-#endif
+-			);
+-
+ 		int const timeout = tracker_req().event == event_t::stopped
+ 			? settings.get_int(settings_pack::stop_tracker_timeout)
+ 			: settings.get_int(settings_pack::tracker_completion_timeout);
+@@ -261,12 +251,73 @@ namespace libtorrent {
+ 		// are that we're shutting down, and this should be a best-effort
+ 		// attempt. It's not worth stalling shutdown.
+ 		aux::proxy_settings ps(settings);
++		aux::resolver_flags const resolver_flags = (tracker_req().event == event_t::stopped
++			? aux::resolver_interface::cache_only : aux::resolver_flags{})
++			| aux::resolver_interface::abort_on_shutdown;
++
++#if TORRENT_USE_CURL
++		// the pooled transport: kept-alive connections (HTTP/2 where the tracker offers it)
++		// per tracker, through the proxy when there is one. i2p keeps using http_connection.
++		bool const proxied = ps.proxy_tracker_connections && ps.type != settings_pack::none;
++		if (settings.get_bool(settings_pack::tracker_http_pool) && !i2p
++			&& (!proxied || ps.type != settings_pack::i2p_proxy))
++		{
++			if (m_man.curl_transport(m_ioc) != nullptr)
++			{
++				m_proxy.clear();
++				m_proxy_username.clear();
++				m_proxy_password.clear();
++				m_proxy_resolves = false;
++				if (proxied)
++				{
++					// as http_connection: only SOCKS5 resolves names through the proxy (when
++					// proxy_hostnames is set); otherwise they are resolved and filtered here
++					bool const socks5 = ps.type == settings_pack::socks5 || ps.type == settings_pack::socks5_pw;
++					m_proxy_resolves = socks5 && ps.proxy_hostnames;
++					char const* scheme = socks5 ? (m_proxy_resolves ? "socks5h" : "socks5")
++						: ps.type == settings_pack::socks4 ? "socks4" : "http";
++					std::string host = ps.hostname;
++					if (host.find(':') != std::string::npos) host = "[" + host + "]";
++					m_proxy = std::string(scheme) + "://" + host + ":" + std::to_string(ps.port);
++					if (ps.type == settings_pack::socks5_pw || ps.type == settings_pack::http_pw)
++					{
++						m_proxy_username = ps.username;
++						m_proxy_password = ps.password;
++					}
++				}
++				m_url = url;
++				m_timeout = timeout;
++				m_user_agent = user_agent;
++				m_bind_device = bi.device;
++				m_bind_address = bi.ip;
++				m_resolver_flags = resolver_flags;
++				start_curl();
++				sent_bytes(int(url.size()) + 100);
++#ifndef TORRENT_DISABLE_LOGGING
++				std::shared_ptr<request_callback> cb = requester();
++				if (cb) cb->debug_log("==> TRACKER_REQUEST [ url: %s pooled ]", url.c_str());
++#endif
++				return;
++			}
++		}
++#endif
++
++		using namespace std::placeholders;
++		m_tracker_connection = std::make_shared<http_connection>(m_ioc, m_man.host_resolver()
++			, std::bind(&http_tracker_connection::on_response, shared_from_this(), _1, _2, _3)
++			, true, settings.get_int(settings_pack::max_http_recv_buffer_size)
++			, std::bind(&http_tracker_connection::on_connect, shared_from_this(), _1)
++			, std::bind(&http_tracker_connection::on_filter, shared_from_this(), _1, _2)
++			, std::bind(&http_tracker_connection::on_filter_hostname, shared_from_this(), _1, _2)
++#if TORRENT_USE_SSL
++			, tracker_req().ssl_ctx
++#endif
++			);
++
+ 		m_tracker_connection->get(url, seconds(timeout)
+ 			, ps.proxy_tracker_connections ? &ps : nullptr
+ 			, 5, user_agent, bi
+-			, (tracker_req().event == event_t::stopped
+-				? aux::resolver_interface::cache_only : aux::resolver_flags{})
+-				| aux::resolver_interface::abort_on_shutdown
++			, resolver_flags
+ #if TORRENT_ABI_VERSION == 1
+ 			, tracker_req().auth
+ #else
+@@ -292,11 +343,19 @@ namespace libtorrent {
+ 
+ 	void http_tracker_connection::close()
+ 	{
++		m_closed = true;
+ 		if (m_tracker_connection)
+ 		{
+ 			m_tracker_connection->close();
+ 			m_tracker_connection.reset();
+ 		}
++#if TORRENT_USE_CURL
++		if (m_curl_id != 0)
++		{
++			if (auto* t = m_man.curl_transport()) t->cancel(m_curl_id);
++			m_curl_id = 0;
++		}
++#endif
+ 		cancel();
+ 		m_man.remove_request(this);
+ 	}
+@@ -304,6 +363,12 @@ namespace libtorrent {
+ 	// endpoints is an in-out parameter
+ 	void http_tracker_connection::on_filter(http_connection& c
+ 		, std::vector<tcp::endpoint>& endpoints)
++	{
++		filter_endpoints(c.url(), endpoints);
++	}
++
++	bool http_tracker_connection::filter_endpoints(std::string const& url
++		, std::vector<tcp::endpoint>& endpoints)
+ 	{
+ 		// filter all endpoints we cannot reach from this listen socket, which may
+ 		// be all of them, in which case we should not announce this listen socket
+@@ -319,7 +384,7 @@ namespace libtorrent {
+ 		if (endpoints.empty())
+ 		{
+ 			fail(lt::errors::announce_skipped, operation_t::get_interface);
+-			return;
++			return false;
+ 		}
+ 
+ 		aux::session_settings const& settings = m_man.settings();
+@@ -334,11 +399,11 @@ namespace libtorrent {
+ 
+ 			error_code ec;
+ 			std::tie(std::ignore, std::ignore, std::ignore, std::ignore, path)
+-				= parse_url_components(c.url(), ec);
++				= parse_url_components(url, ec);
+ 			if (ec)
+ 			{
+ 				fail(ec, operation_t::parse_address);
+-				return;
++				return false;
+ 			}
+ 
+ 			// this is mitigation for Server Side request forgery. Any tracker
+@@ -358,12 +423,11 @@ namespace libtorrent {
+ 			if (endpoints.empty())
+ 			{
+ 				fail(errors::ssrf_mitigation, operation_t::bittorrent);
+-				return;
++				return false;
+ 			}
+ 		}
+ 
+-		TORRENT_UNUSED(c);
+-		if (!tracker_req().filter) return;
++		if (!tracker_req().filter) return true;
+ 
+ 		// remove endpoints that are filtered by the IP filter
+ 		for (auto i = endpoints.begin(); i != endpoints.end();)
+@@ -382,7 +446,11 @@ namespace libtorrent {
+ 		}
+ #endif
+ 		if (endpoints.empty())
++		{
+ 			fail(errors::banned_by_ip_filter, operation_t::bittorrent);
++			return false;
++		}
++		return true;
+ 	}
+ 
+ 	// returns true if the hostname is allowed
+@@ -394,6 +462,191 @@ namespace libtorrent {
+ 		return !is_idna(hostname);
+ 	}
+ 
++	void http_tracker_connection::report_outcome(error_code const& ec, int const status)
++	{
++		// for tracker_manager's per-tracker limits: did the tracker answer?
++		if (m_outcome != outcome::none) return;
++		if (ec == boost::asio::error::operation_aborted) return;
++		if ((ec && ec != boost::asio::error::eof) || status == 0) m_outcome = outcome::failure;
++		else m_outcome = status >= 500 ? outcome::failure : outcome::success;
++	}
++
++#if TORRENT_USE_CURL
++	void http_tracker_connection::start_curl()
++	{
++		error_code ec;
++		std::string protocol, auth, hostname, path;
++		int port = -1;
++		std::tie(protocol, auth, hostname, port, path) = parse_url_components(m_url, ec);
++		if (ec)
++		{
++			fail(ec, operation_t::parse_address);
++			return;
++		}
++		if (protocol != "http" && protocol != "https")
++		{
++			fail(errors::unsupported_url_protocol, operation_t::parse_address);
++			return;
++		}
++		if (!m_man.settings().get_bool(settings_pack::allow_idna) && is_idna(hostname))
++		{
++			fail(errors::blocked_by_idna, operation_t::bittorrent);
++			return;
++		}
++
++		std::string literal = hostname;
++		if (literal.size() > 2 && literal.front() == '[' && literal.back() == ']')
++			literal = literal.substr(1, literal.size() - 2);
++		error_code aec;
++		address const ip = make_address(literal, aec);
++		if (!aec)
++		{
++			on_curl_resolved(error_code(), std::vector<address>{ip});
++			return;
++		}
++		// the proxy resolves the name: nothing to resolve or filter here (as http_connection)
++		if (m_proxy_resolves)
++		{
++			on_curl_resolved(error_code(), std::vector<address>{});
++			return;
++		}
++
++		std::shared_ptr<http_tracker_connection> self = shared_from_this();
++		m_man.host_resolver().async_resolve(hostname, m_resolver_flags
++			, [self](error_code const& e, std::vector<address> const& addresses)
++			{ self->on_curl_resolved(e, addresses); });
++	}
++
++	void http_tracker_connection::on_curl_resolved(error_code const& ec
++		, std::vector<address> const& addresses)
++	{
++		if (m_closed) return;
++		if (ec)
++		{
++			m_outcome = outcome::failure;
++			fail(ec, operation_t::hostname_lookup);
++			return;
++		}
++
++		error_code pec;
++		std::string protocol, auth, hostname, path;
++		int port = -1;
++		std::tie(protocol, auth, hostname, port, path) = parse_url_components(m_url, pec);
++		if (port <= 0) port = protocol == "https" ? 443 : 80;
++
++		std::vector<tcp::endpoint> endpoints;
++		for (auto const& a : addresses) endpoints.emplace_back(a, std::uint16_t(port));
++		// listen socket routing, SSRF mitigation and the IP filter, as for http_connection
++		// (not when the proxy resolves the name: there are no addresses to filter)
++		if (!(m_proxy_resolves && addresses.empty()) && !filter_endpoints(m_url, endpoints)) return;
++		m_endpoints = endpoints;
++
++		aux::session_settings const& settings = m_man.settings();
++		aux::curl_tracker_request r;
++		r.url = m_url;
++		r.host = hostname;
++		r.port = port;
++		bool const literal = !hostname.empty() && (hostname.front() == '['
++			|| (addresses.size() == 1 && addresses.front().to_string() == hostname));
++		if (!literal)
++			for (auto const& ep : endpoints) r.addresses.push_back(ep.address());
++		r.user_agent = m_user_agent;
++		r.bind_device = m_bind_device;
++		r.bind_address = m_bind_address;
++		r.timeout_ms = std::max(1, m_timeout) * 1000;
++		r.connect_timeout_ms = std::max(1, settings.get_int(settings_pack::tracker_connect_timeout)) * 1000;
++		r.verify_tls = settings.get_bool(settings_pack::validate_https_trackers);
++		r.http2 = settings.get_bool(settings_pack::tracker_http2);
++		r.proxy = m_proxy;
++		r.proxy_username = m_proxy_username;
++		r.proxy_password = m_proxy_password;
++		r.max_response_size = std::size_t(std::max(1024, settings.get_int(settings_pack::max_http_recv_buffer_size)));
++
++		aux::curl_tracker_transport* t = m_man.curl_transport();
++		if (t == nullptr)
++		{
++			fail(boost::asio::error::operation_aborted, operation_t::connect);
++			return;
++		}
++		std::shared_ptr<http_tracker_connection> self = shared_from_this();
++		m_curl_id = t->perform(r, [self](aux::curl_tracker_response resp)
++			{ self->on_curl_done(std::move(resp)); });
++	}
++
++	void http_tracker_connection::on_curl_done(aux::curl_tracker_response resp)
++	{
++		m_curl_id = 0;
++		if (m_closed) return;
++		if (resp.ec)
++		{
++			m_outcome = outcome::failure;
++			fail(resp.ec, operation_t::connect, resp.error_message.c_str());
++			return;
++		}
++
++		// redirects are followed here, not by curl, so every hop is resolved and
++		// filtered like the first one (as http_connection does, at most 5)
++		if (resp.status == 301 || resp.status == 302 || resp.status == 303
++			|| resp.status == 307 || resp.status == 308)
++		{
++			std::string location;
++			std::size_t pos = 0;
++			while (pos < resp.headers.size())
++			{
++				std::size_t const end = resp.headers.find('\n', pos);
++				std::string line = resp.headers.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
++				pos = end == std::string::npos ? resp.headers.size() : end + 1;
++				std::size_t const colon = line.find(':');
++				if (colon == std::string::npos) continue;
++				std::string name = line.substr(0, colon);
++				std::transform(name.begin(), name.end(), name.begin(), [](char c) { return char(std::tolower(c)); });
++				if (name != "location") continue;
++				location = line.substr(colon + 1);
++				location.erase(0, location.find_first_not_of(" \t"));
++				location.erase(location.find_last_not_of(" \t\r") + 1);
++			}
++			if (!location.empty() && m_redirects < 5)
++			{
++				++m_redirects;
++				m_url = resolve_redirect_location(m_url, location);
++				start_curl();
++				return;
++			}
++		}
++
++		m_tracker_ip = resp.peer;
++		m_http2 = resp.http_version == 20;
++
++		// hand on_response() a parser with this response's status line and headers. curl
++		// already removed the transfer and content encoding, so those headers are dropped
++		std::string head = "HTTP/1.1 " + std::to_string(resp.status) + " "
++			+ (resp.reason.empty() ? std::string("-") : resp.reason) + "\r\n";
++		std::size_t pos = 0;
++		while (pos < resp.headers.size())
++		{
++			std::size_t const end = resp.headers.find('\n', pos);
++			std::string line = resp.headers.substr(pos, end == std::string::npos ? std::string::npos : end - pos + 1);
++			pos = end == std::string::npos ? resp.headers.size() : end + 1;
++			std::string lower = line.substr(0, line.find(':'));
++			std::transform(lower.begin(), lower.end(), lower.begin(), [](char c) { return char(std::tolower(c)); });
++			if (lower == "content-length" || lower == "transfer-encoding" || lower == "content-encoding") continue;
++			if (!line.empty() && line.back() != '\n') line += "\r\n";
++			head += line;
++		}
++		head += "\r\n";
++		http_parser parser;
++		bool error = false;
++		parser.incoming(span<char const>(head.data(), std::ptrdiff_t(head.size())), error);
++		if (error || !parser.header_finished())
++		{
++			m_outcome = outcome::failure;
++			fail(errors::http_parse_error, operation_t::sock_read);
++			return;
++		}
++		on_response(error_code(), parser, span<char const>(resp.body.data(), std::ptrdiff_t(resp.body.size())));
++	}
++#endif
++
+ 	void http_tracker_connection::on_connect(http_connection& c)
+ 	{
+ 		error_code ec;
+@@ -407,6 +660,8 @@ namespace libtorrent {
+ 		// keep this alive
+ 		std::shared_ptr<http_tracker_connection> me(shared_from_this());
+ 
++		report_outcome(ec, parser.header_finished() ? parser.status_code() : 0);
++
+ 		if (ec && ec != boost::asio::error::eof)
+ 		{
+ 			fail(ec, operation_t::sock_read);
+@@ -477,6 +732,12 @@ namespace libtorrent {
+ 					ip_list.push_back(endp.address());
+ 				}
+ 			}
++#if TORRENT_USE_CURL
++			else
++			{
++				for (auto const& endp : m_endpoints) ip_list.push_back(endp.address());
++			}
++#endif
+ 
+ 			cb->tracker_response(tracker_req(), m_tracker_ip, ip_list, resp);
+ 		}
+diff --git a/src/settings_pack.cpp b/src/settings_pack.cpp
+index 11b19c7d6..b983564e0 100644
+--- a/src/settings_pack.cpp
++++ b/src/settings_pack.cpp
+@@ -243,6 +243,8 @@ constexpr int DISK_WRITE_MODE = settings_pack::enable_os_cache;
+ 		SET(proxy_send_host_in_connect, false, nullptr),
+ 		SET(disk_disable_copy_on_write, false, nullptr),
+ 		SET(allow_multiple_connections_per_pid, false, nullptr),
++		SET(tracker_http_pool, true, nullptr),
++		SET(tracker_http2, true, nullptr),
+ 	}});
+ 
+ 	CONSTEXPR_SETTINGS
+@@ -409,7 +411,14 @@ constexpr int DISK_WRITE_MODE = settings_pack::enable_os_cache;
+ 		SET(announce_port, 0, nullptr),
+ 		SET(i2p_inbound_length_variance, 0, nullptr),
+ 		SET(i2p_outbound_length_variance, 0, nullptr),
+-		SET(natpmp_lease_duration, 3600, nullptr)
++		SET(natpmp_lease_duration, 3600, nullptr),
++		SET(tracker_host_max_concurrency, 32, nullptr),
++		SET(tracker_host_max_streams, 250, nullptr),
++		SET(tracker_stopped_concurrency, 256, nullptr),
++		SET(tracker_failure_threshold, 5, nullptr),
++		SET(tracker_connect_timeout, 10, nullptr),
++		SET(tracker_queue_timeout, 600, nullptr),
++		SET(tracker_host_max_queue, 20000, nullptr)
+ 	}});
+ 
+ #undef SET
+diff --git a/src/tracker_manager.cpp b/src/tracker_manager.cpp
+index b509ee317..cf4a704e7 100644
+--- a/src/tracker_manager.cpp
++++ b/src/tracker_manager.cpp
+@@ -44,6 +44,7 @@ POSSIBILITY OF SUCH DAMAGE.
+ #include "libtorrent/performance_counters.hpp"
+ #include "libtorrent/socket_io.hpp"
+ #include "libtorrent/ssl.hpp"
++#include "libtorrent/parse_url.hpp"
+ 
+ using namespace std::placeholders;
+ 
+@@ -219,6 +220,8 @@ constexpr tracker_request_flags_t tracker_request::high_priority;
+ 
+ 	tracker_manager::~tracker_manager()
+ 	{
++		m_alive.reset();
++		if (m_http_timer) m_http_timer->cancel();
+ 		abort_all_requests(true);
+ 	}
+ 
+@@ -241,26 +244,309 @@ constexpr tracker_request_flags_t tracker_request::high_priority;
+ 			, [c] (std::shared_ptr<http_tracker_connection> const& ptr) { return ptr.get() == c; });
+ 		if (i != m_http_conns.end())
+ 		{
++			// keep it alive until the bookkeeping is done
++			std::shared_ptr<http_tracker_connection> me = *i;
+ 			m_http_conns.erase(i);
+-			if (!m_queued.empty())
++			http_request_done(*me);
++			dispatch_http();
++			return;
++		}
++
++		auto const h = m_http_hosts.find(c->m_host_key);
++		if (h == m_http_hosts.end()) return;
++		auto& q = h->second.queue;
++		auto const j = std::find_if(q.begin(), q.end()
++			, [c] (std::shared_ptr<http_tracker_connection> const& ptr) { return ptr.get() == c; });
++		if (j != q.end())
++		{
++			unqueue_key(h->second.queued_keys, key_of(**j));
++			q.erase(j);
++			m_stats_counters.set_value(counters::num_queued_tracker_announces, std::int64_t(num_queued_http()));
++			arm_http_timer();
++		}
++	}
++
++	tracker_manager::order_key tracker_manager::key_of(http_tracker_connection const& c)
++	{
++		tracker_request const& r = c.tracker_req();
++		return order_key(c.m_order_requester, r.outgoing_socket, r.info_hash);
++	}
++
++	void tracker_manager::unqueue_key(std::multiset<order_key>& keys, order_key const& k)
++	{
++		auto const f = keys.find(k);
++		TORRENT_ASSERT(f != keys.end());
++		if (f != keys.end()) keys.erase(f);
++	}
++
++	int tracker_manager::num_queued_http() const
++	{
++		int n = 0;
++		for (auto const& h : m_http_hosts) n += int(h.second.queue.size());
++		return n;
++	}
++
++	void tracker_manager::fail_down(std::shared_ptr<http_tracker_connection> const& c
++		, http_host const& h, std::string const& key)
++	{
++		char msg[200];
++		std::snprintf(msg, sizeof(msg), "tracker down (%d requests failed in a row), next attempt in %d s"
++			, h.failures, int(std::max(std::int64_t(0), std::int64_t(total_seconds(h.retry_at - clock_type::now())))));
++#ifndef TORRENT_DISABLE_LOGGING
++		std::shared_ptr<request_callback> rc = c->requester();
++		if (rc) rc->debug_log("*** TRACKER_DOWN [ %s ] %s", key.c_str(), msg);
++#else
++		TORRENT_UNUSED(key);
++#endif
++		c->fail(boost::asio::error::host_unreachable, operation_t::connect, msg);
++	}
++
++	void tracker_manager::http_request_done(http_tracker_connection const& c)
++	{
++		auto const it = m_http_hosts.find(c.m_host_key);
++		if (it == m_http_hosts.end()) return;
++		http_host& h = it->second;
++		TORRENT_ASSERT(h.inflight > 0);
++		--h.inflight;
++		h.inflight_keys.erase(key_of(c));
++		bool const was_probe = h.probe == &c;
++		if (was_probe)
++		{
++			h.probe = nullptr;
++			h.probing = false;
++		}
++		if (c.m_outcome == http_tracker_connection::outcome::success) h.multiplexed = c.m_http2;
++		int const max_limit = std::max(1, m_settings.get_int(h.multiplexed
++			? settings_pack::tracker_host_max_streams : settings_pack::tracker_host_max_concurrency));
++		switch (c.m_outcome)
++		{
++			case http_tracker_connection::outcome::success:
++				h.failures = 0;
++				if (h.down)
++				{
++					// the tracker answered: it is back. The held requests go out now,
++					// starting small again
++					h.down = false;
++					h.backoff = seconds32(10);
++					h.limit = 4;
++					h.slow_start = true;
++				}
++				else if (!h.queue.empty())
++				{
++					// more demand than slots: grow
++					h.limit += h.slow_start ? 1.0 : 1.0 / h.limit;
++					if (h.limit > max_limit) h.limit = max_limit;
++				}
++				break;
++			case http_tracker_connection::outcome::failure:
++				++h.failures;
++				h.slow_start = false;
++				h.limit = std::max(1.0, h.limit / 2);
++				if (h.down)
++				{
++					// only the probe's result moves the back-off; requests that were
++					// already running when the tracker went down just fail
++					if (was_probe)
++					{
++						h.backoff = std::min(h.backoff * 2, seconds32(30));
++						h.retry_at = clock_type::now() + h.backoff;
++					}
++				}
++				else if (h.failures >= std::max(1, m_settings.get_int(settings_pack::tracker_failure_threshold)))
++				{
++					h.down = true;
++					h.backoff = seconds32(10);
++					h.retry_at = clock_type::now() + h.backoff;
++				}
++				break;
++			case http_tracker_connection::outcome::none:
++				// cancelled or filtered before reaching the tracker: probe again soon
++				if (was_probe) h.retry_at = clock_type::now();
++				break;
++		}
++		arm_http_timer();
++	}
++
++	void tracker_manager::arm_http_timer()
++	{
++		// wake up when the next probe of a tracker that is down is due, or the
++		// oldest queued request (the front of its queue) times out
++		time_point next = max_time();
++		seconds const queue_timeout(std::max(1, m_settings.get_int(settings_pack::tracker_queue_timeout)));
++		for (auto& e : m_http_hosts)
++		{
++			http_host& h = e.second;
++			if (h.queue.empty())
++			{
++				h.unordered = false;
++				continue;
++			}
++			if (h.down && !h.probing && h.retry_at < next) next = h.retry_at;
++			// the queue is in arrival order (oldest first) unless high priority
++			// requests were put in front
++			time_point oldest = h.queue.front()->m_queued_at;
++			if (h.unordered)
++			{
++				for (auto const& c : h.queue)
++					oldest = std::min(oldest, c->m_queued_at);
++			}
++			if (oldest + queue_timeout < next) next = oldest + queue_timeout;
++		}
++		if (next == max_time() || m_ios == nullptr)
++		{
++			// nothing to wait for: a pending wait would keep the io_context (and a
++			// session that is shutting down) running until it expires
++			if (m_http_timer && m_http_timer_at != max_time())
+ 			{
+-				auto conn = std::move(m_queued.front());
+-				m_queued.pop_front();
+-				m_http_conns.push_back(std::move(conn));
+-				m_http_conns.back()->start();
+-				m_stats_counters.set_value(counters::num_queued_tracker_announces, std::int64_t(m_queued.size()));
++				m_http_timer->cancel();
++				m_http_timer_at = max_time();
+ 			}
+ 			return;
+ 		}
++		if (m_http_timer && next >= m_http_timer_at && m_http_timer_at > clock_type::now()) return;
++		if (!m_http_timer) m_http_timer.reset(new deadline_timer(*m_ios));
++		m_http_timer_at = next;
++		m_http_timer->expires_at(next);
++		std::weak_ptr<bool> alive = m_alive;
++		m_http_timer->async_wait([this, alive](error_code const& ec)
++		{
++			if (ec || alive.expired()) return;
++			m_http_timer_at = max_time();
++			expire_http_queue(true);
++			dispatch_http();
++			arm_http_timer();
++		});
++	}
+ 
+-		auto const j = std::find_if(m_queued.begin(), m_queued.end()
+-			, [c] (std::shared_ptr<http_tracker_connection> const& ptr) { return ptr.get() == c; });
+-		if (j != m_queued.end())
++	void tracker_manager::expire_http_queue(bool const force)
++	{
++		time_point const now = clock_type::now();
++		if (!force && now < m_next_queue_scan) return;
++		m_next_queue_scan = now + seconds(5);
++
++		seconds const timeout(std::max(1, m_settings.get_int(settings_pack::tracker_queue_timeout)));
++		std::vector<std::shared_ptr<http_tracker_connection>> timed_out;
++		std::vector<std::shared_ptr<http_tracker_connection>> orphaned;
++		for (auto& e : m_http_hosts)
++		{
++			auto& q = e.second.queue;
++			for (auto i = q.begin(); i != q.end();)
++			{
++				http_tracker_connection const& c = **i;
++				order_key const k = key_of(c);
++				if (c.m_has_socket && !c.tracker_req().outgoing_socket)
++					orphaned.push_back(std::move(*i));
++				else if (now - c.m_queued_at >= timeout)
++					timed_out.push_back(std::move(*i));
++				else
++				{
++					++i;
++					continue;
++				}
++				unqueue_key(e.second.queued_keys, k);
++				i = q.erase(i);
++			}
++		}
++		if (timed_out.empty() && orphaned.empty()) return;
++
++		// failing removes nothing from the queues any more (remove_request() does
++		// not find them), the torrents get the error and retry on their own schedule
++		for (auto const& c : timed_out)
++			c->fail(boost::asio::error::timed_out, operation_t::connect, "timed out in the tracker queue");
++		for (auto const& c : orphaned)
++			c->fail(boost::asio::error::operation_aborted, operation_t::connect, "listen socket closed");
++		m_stats_counters.set_value(counters::num_queued_tracker_announces, std::int64_t(num_queued_http()));
++	}
++
++	void tracker_manager::dispatch_http()
++	{
++		expire_http_queue(false);
++		if (m_http_hosts.empty()) return;
++		int const global = std::max(1, m_settings.get_int(settings_pack::max_concurrent_http_announces));
++		int const host_max = std::max(1, m_settings.get_int(settings_pack::tracker_host_max_concurrency));
++		int const stream_max = std::max(1, m_settings.get_int(settings_pack::tracker_host_max_streams));
++		int const stopped_max = std::max(1, m_settings.get_int(settings_pack::tracker_stopped_concurrency));
++		bool progress = true;
++		while (progress && int(m_http_conns.size()) < global)
++		{
++			progress = false;
++			// one request per tracker per round, starting after the one that went last
++			auto it = m_http_hosts.upper_bound(m_http_cursor);
++			for (std::size_t n = 0; n < m_http_hosts.size() && int(m_http_conns.size()) < global; ++n, ++it)
++			{
++				if (it == m_http_hosts.end()) it = m_http_hosts.begin();
++				http_host& h = it->second;
++				if (h.queue.empty()) continue;
++				if (h.down)
++				{
++					// held: one probe at a time, when the back-off has passed
++					if (h.probing || clock_type::now() < h.retry_at) continue;
++				}
++
++				// the first request whose torrent has no request to this tracker in
++				// flight or waiting ahead of it: a torrent's announces reach the
++				// tracker one at a time, in the order they were made
++				auto pick = h.queue.begin();
++				if (!h.inflight_keys.empty() && h.inflight_keys.count(key_of(**pick)))
++				{
++					std::set<order_key> ahead;
++					for (pick = h.queue.begin(); pick != h.queue.end(); ++pick)
++					{
++						order_key const k = key_of(**pick);
++						if (!h.inflight_keys.count(k) && !ahead.count(k)) break;
++						ahead.insert(k);
++					}
++					if (pick == h.queue.end()) continue;
++				}
++
++				if (!h.down)
++				{
++					int lim = std::min(h.multiplexed ? stream_max : host_max, std::max(1, int(h.limit)));
++					// stopped announces (shutdown) get a higher cap; on HTTP/2 they are cheap streams
++					if ((*pick)->tracker_req().event == event_t::stopped)
++						lim = std::max(lim, h.multiplexed ? global : stopped_max);
++					if (h.inflight >= lim) continue;
++				}
++				std::shared_ptr<http_tracker_connection> con = std::move(*pick);
++				h.queue.erase(pick);
++				unqueue_key(h.queued_keys, key_of(*con));
++				if (con->m_has_socket && !con->tracker_req().outgoing_socket)
++				{
++					// its listen socket closed while it waited
++					con->fail(boost::asio::error::operation_aborted, operation_t::connect, "listen socket closed");
++					progress = true;
++					continue;
++				}
++				if (h.down)
++				{
++					h.probing = true;
++					h.probe = con.get();
++				}
++				++h.inflight;
++				h.inflight_keys.insert(key_of(*con));
++				m_http_conns.push_back(con);
++				m_http_cursor = it->first;
++				progress = true;
++				con->start();
++			}
++		}
++		m_stats_counters.set_value(counters::num_queued_tracker_announces, std::int64_t(num_queued_http()));
++		arm_http_timer();
++	}
++
++#if TORRENT_USE_CURL
++	aux::curl_tracker_transport* tracker_manager::curl_transport(io_context& ios)
++	{
++		if (!m_curl_tried)
+ 		{
+-			m_queued.erase(j);
+-			m_stats_counters.set_value(counters::num_queued_tracker_announces, std::int64_t(m_queued.size()));
++			m_curl_tried = true;
++			m_curl.reset(new aux::curl_tracker_transport(ios));
++			if (!m_curl->valid()) m_curl.reset();
+ 		}
++		return m_curl.get();
+ 	}
++#endif
++
+ 
+ 	void tracker_manager::remove_request(udp_tracker_connection const* c)
+ 	{
+@@ -303,24 +589,57 @@ constexpr tracker_request_flags_t tracker_request::high_priority;
+ 		if (protocol == "http")
+ #endif
+ 		{
++			TORRENT_UNUSED(sett);
+ 			auto con = std::make_shared<http_tracker_connection>(ios, *this, std::move(req), c);
+-			if (m_http_conns.size() < std::size_t(sett.get_int(settings_pack::max_concurrent_http_announces)))
++			tracker_request const& r = con->tracker_req();
++
++			// the per-tracker queue: scheme, host, port and the local address it goes out of
++			error_code ec;
++			std::string scheme, auth, host, path;
++			int port = -1;
++			std::tie(scheme, auth, host, port, path) = parse_url_components(r.url, ec);
++			if (port <= 0) port = scheme == "https" ? 443 : 80;
++			std::string key = scheme + "://" + host + ":" + std::to_string(port);
++			if (r.outgoing_socket)
++				key += "|" + r.outgoing_socket.get_local_endpoint().address().to_string();
++			con->m_host_key = key;
++			m_ios = &ios;
++			http_host& h = m_http_hosts[key];
++
++			if (h.down && r.event == event_t::stopped)
++			{
++				// don't make shutdown (or stopping a torrent) wait for a tracker that is down
++				fail_down(con, h, key);
++				return;
++			}
++
++			if (int(h.queue.size()) >= std::max(1, m_settings.get_int(settings_pack::tracker_host_max_queue)))
++			{
++				con->fail(boost::asio::error::no_buffer_space, operation_t::connect, "tracker queue full");
++				return;
++			}
++
++			// a tracker that is down holds its requests until a probe gets through
++			// (or they time out in its queue)
++			con->m_queued_at = clock_type::now();
++			con->m_has_socket = bool(r.outgoing_socket);
++			con->m_order_requester = con->requester().get();
++			order_key const order = key_of(*con);
++			// ahead of other torrents' requests, never of an older one of its own
++			bool const own_waiting = h.queued_keys.count(order) > 0;
++			h.queued_keys.insert(order);
++			if (high_priority && !own_waiting)
+ 			{
+-				m_http_conns.push_back(std::move(con));
+-				m_http_conns.back()->start();
++				// ahead of the requests already waiting for this tracker
++				h.queue.push_front(std::move(con));
++				h.unordered = true;
+ 			}
+ 			else
+ 			{
+-				if (high_priority)
+-				{
+-					m_queued.push_front(std::move(con));
+-				}
+-				else
+-				{
+-					m_queued.push_back(std::move(con));
+-				}
+-				m_stats_counters.set_value(counters::num_queued_tracker_announces, std::int64_t(m_queued.size()));
++				h.queue.push_back(std::move(con));
+ 			}
++			dispatch_http();
++			arm_http_timer();
+ 			return;
+ 		}
+ 		else if (protocol == "udp")
+@@ -459,29 +778,35 @@ constexpr tracker_request_flags_t tracker_request::high_priority;
+ 		std::vector<std::shared_ptr<http_tracker_connection>> close_http_started;
+ 		std::vector<std::shared_ptr<udp_tracker_connection>> close_udp_connections;
+ 
+-		// remove queued (not yet started) requests from the queue right
++		// remove queued (not yet started) requests from the queues right
+ 		// away, rather than leaving that to the closing loop below.
+ 		// Otherwise, closing one of the started connections below would
+ 		// dequeue and start the next queued request, just to abort it
+ 		// again immediately after.
+-		for (auto it = m_queued.begin(); it != m_queued.end();)
++		for (auto& h : m_http_hosts)
+ 		{
+-			tracker_request const& req = (*it)->tracker_req();
+-			if (req.event == event_t::stopped && !all)
++			auto& q = h.second.queue;
++			for (auto it = q.begin(); it != q.end();)
+ 			{
+-				++it;
+-				continue;
+-			}
++				tracker_request const& req = (*it)->tracker_req();
++				if (req.event == event_t::stopped && !all)
++				{
++					++it;
++					continue;
++				}
+ 
+ #ifndef TORRENT_DISABLE_LOGGING
+-			std::shared_ptr<request_callback> rc = (*it)->requester();
+-			if (rc) rc->debug_log("aborting: %s", req.url.c_str());
++				std::shared_ptr<request_callback> rc = (*it)->requester();
++				if (rc) rc->debug_log("aborting: %s", req.url.c_str());
+ #endif
+-			close_http_queued.push_back(*it);
+-			it = m_queued.erase(it);
++				close_http_queued.push_back(*it);
++				unqueue_key(h.second.queued_keys, key_of(**it));
++				it = q.erase(it);
++			}
+ 		}
+ 		m_stats_counters.set_value(
+-			counters::num_queued_tracker_announces, std::int64_t(m_queued.size()));
++			counters::num_queued_tracker_announces, std::int64_t(num_queued_http()));
++		if (!all) arm_http_timer();
+ 
+ 		for (auto const& c : m_http_conns)
+ 		{
+@@ -543,7 +868,7 @@ constexpr tracker_request_flags_t tracker_request::high_priority;
+ 	bool tracker_manager::empty() const
+ 	{
+ 		TORRENT_ASSERT(is_single_thread());
+-		return m_http_conns.empty() && m_udp_conns.empty();
++		return m_http_conns.empty() && m_udp_conns.empty() && num_queued_http() == 0;
+ 	}
+ 
+ 	int tracker_manager::num_requests() const
+-- 
+2.47.3
+

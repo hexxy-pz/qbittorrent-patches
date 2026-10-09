@@ -1,0 +1,685 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anonymous <anonymous@localhost>
+Date: Fri, 09 Oct 2026 01:26:41 +0000
+Subject: [PATCH 19/20] Load piece hashes of idle torrents from the resume data
+ database
+
+A torrent's SHA-1 piece hashes are ~99% of its metadata, and qBittorrent kept
+all of them in memory (~790 MB at 8,900 torrents) although a seed only needs
+them for a recheck, seed-mode piece verification or to export its metadata.
+
+With the SQLite resume data storage, torrents loaded from it now start without
+their piece hashes in memory (lt::torrent_info::load_piece_hashes_on_demand());
+libtorrent loads them through a read-only SQLite connection when it needs them
+and a one-minute timer frees them again once a torrent has not used them for
+BitTorrent/Session/PieceHashesIdleTime minutes (default 15; libtorrent doubles
+it for a torrent whose hashes were freed too early) and is not downloading,
+checking or moving. Newly added torrents keep theirs until their metadata has
+been written to the database.
+
+BitTorrent/Session/PieceHashesOnDemand=false turns it off.
+---
+ src/base/CMakeLists.txt                      |   4 +
+ src/base/bittorrent/dbresumedatastorage.cpp  | 144 ++++++++++++++++++-
+ src/base/bittorrent/dbresumedatastorage.h    |  11 ++
+ src/base/bittorrent/loadtorrentparams.h      |   2 +
+ src/base/bittorrent/resumedatastorage.h      |   2 +
+ src/base/bittorrent/session.h                |   4 +
+ src/base/bittorrent/sessionimpl.cpp          |  73 +++++++++-
+ src/base/bittorrent/sessionimpl.h            |  13 ++
+ src/base/bittorrent/torrentimpl.cpp          |  16 +++
+ src/base/bittorrent/torrentimpl.h            |   8 ++
+ src/webui/api/appcontroller.cpp              |   6 +
+ src/webui/www/private/views/preferences.html |  20 +++
+ 12 files changed, 296 insertions(+), 7 deletions(-)
+
+diff --git a/src/base/CMakeLists.txt b/src/base/CMakeLists.txt
+index 5bb0077..7d4e767 100644
+--- a/src/base/CMakeLists.txt
++++ b/src/base/CMakeLists.txt
+@@ -217,10 +217,14 @@ add_library(qbt_base STATIC
+     utils/version.cpp
+ )
+ 
++# the SQLite resume data storage reads piece hashes on libtorrent's threads, outside Qt SQL
++find_package(SQLite3 REQUIRED)
++
+ target_link_libraries(qbt_base
+     PRIVATE
+         OpenSSL::Crypto
+         OpenSSL::SSL
++        SQLite::SQLite3
+         ZLIB::ZLIB
+     PUBLIC
+         LibtorrentRasterbar::torrent-rasterbar
+diff --git a/src/base/bittorrent/dbresumedatastorage.cpp b/src/base/bittorrent/dbresumedatastorage.cpp
+index f9cc187..a8fa0aa 100644
+--- a/src/base/bittorrent/dbresumedatastorage.cpp
++++ b/src/base/bittorrent/dbresumedatastorage.cpp
+@@ -28,10 +28,14 @@
+ 
+ #include "dbresumedatastorage.h"
+ 
++#include <functional>
+ #include <memory>
++#include <mutex>
+ #include <queue>
+ #include <utility>
+ 
++#include <sqlite3.h>
++
+ #include <libtorrent/bdecode.hpp>
+ #include <libtorrent/bencode.hpp>
+ #include <libtorrent/entry.hpp>
+@@ -83,15 +87,18 @@ namespace
+         virtual void perform(QSqlDatabase db) = 0;
+     };
+ 
++    using MetadataStoredHandler = std::function<void (const TorrentID &)>;
++
+     class StoreJob final : public Job
+     {
+     public:
+-        StoreJob(const TorrentID &torrentID, const LoadTorrentParams &resumeData);
++        StoreJob(const TorrentID &torrentID, const LoadTorrentParams &resumeData, MetadataStoredHandler metadataStoredHandler);
+         void perform(QSqlDatabase db) override;
+ 
+     private:
+         const TorrentID m_torrentID;
+         const LoadTorrentParams m_resumeData;
++        const MetadataStoredHandler m_metadataStoredHandler;
+     };
+ 
+     class RemoveJob final : public Job
+@@ -226,7 +233,7 @@ namespace BitTorrent
+         Q_DISABLE_COPY_MOVE(Worker)
+ 
+     public:
+-        Worker(const Path &dbPath, QReadWriteLock &dbLock, QObject *parent = nullptr);
++        Worker(const Path &dbPath, QReadWriteLock &dbLock, MetadataStoredHandler metadataStoredHandler, QObject *parent = nullptr);
+ 
+         void run() override;
+         void requestInterruption();
+@@ -241,6 +248,7 @@ namespace BitTorrent
+         const QString m_connectionName = u"ResumeDataStorageWorker"_s;
+         const Path m_path;
+         QReadWriteLock &m_dbLock;
++        const MetadataStoredHandler m_metadataStoredHandler;
+ 
+         std::queue<std::unique_ptr<Job>> m_jobs;
+         QMutex m_jobsMutex;
+@@ -248,8 +256,106 @@ namespace BitTorrent
+     };
+ }
+ 
++// Reads the "info" dictionary of a torrent's stored metadata. Called by libtorrent from any thread (mostly its
++// network thread, to verify a piece), so it uses its own read-only SQLite connection instead of Qt's, which are
++// bound to the thread that opened them. WAL mode lets it read while the worker writes.
++class BitTorrent::DBResumeDataStorage::InfoSectionReader
++{
++public:
++    InfoSectionReader(const Path &dbPath, const int bdecodeDepthLimit, const int bdecodeTokenLimit)
++        : m_dbPath {dbPath}
++        , m_bdecodeDepthLimit {bdecodeDepthLimit}
++        , m_bdecodeTokenLimit {bdecodeTokenLimit}
++    {
++    }
++
++    ~InfoSectionReader()
++    {
++        sqlite3_finalize(m_statement);
++        sqlite3_close(m_db);
++    }
++
++    std::vector<char> read(const lt::info_hash_t &infoHash)
++    {
++        const QByteArray torrentID = TorrentID::fromInfoHash(InfoHash(infoHash)).toString().toLatin1();
++
++        const std::lock_guard lock {m_mutex};
++        if (!m_statement && !open())
++            return {};
++
++        std::vector<char> infoSection;
++        sqlite3_bind_text(m_statement, 1, torrentID.constData(), static_cast<int>(torrentID.size()), SQLITE_TRANSIENT);
++        if (const int result = sqlite3_step(m_statement); result == SQLITE_ROW)
++        {
++            const auto *metadata = static_cast<const char *>(sqlite3_column_blob(m_statement, 0));
++            const int metadataSize = sqlite3_column_bytes(m_statement, 0);
++            lt::error_code ec;
++            const lt::bdecode_node root = lt::bdecode({metadata, metadataSize}, ec
++                    , nullptr, m_bdecodeDepthLimit, m_bdecodeTokenLimit);
++            if (const lt::bdecode_node info = (ec ? lt::bdecode_node() : root.dict_find_dict("info")))
++            {
++                const lt::span<const char> section = info.data_section();
++                infoSection.assign(section.begin(), section.end());
++            }
++            else
++            {
++                LogMsg(ResumeDataStorage::tr("Couldn't load piece hashes of torrent '%1': invalid metadata.")
++                        .arg(QString::fromLatin1(torrentID)), Log::CRITICAL);
++            }
++        }
++        else
++        {
++            LogMsg(ResumeDataStorage::tr("Couldn't load piece hashes of torrent '%1': %2")
++                    .arg(QString::fromLatin1(torrentID)
++                        , ((result == SQLITE_DONE) ? u"no metadata"_s : QString::fromUtf8(sqlite3_errmsg(m_db))))
++                    , Log::CRITICAL);
++        }
++        sqlite3_reset(m_statement);
++        sqlite3_clear_bindings(m_statement);
++        return infoSection;
++    }
++
++private:
++    bool open()
++    {
++        if (!m_db)
++        {
++            const QByteArray path = m_dbPath.toString().toUtf8();
++            if (sqlite3_open_v2(path.constData(), &m_db, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK)
++            {
++                LogMsg(ResumeDataStorage::tr("Couldn't open '%1' to load piece hashes: %2")
++                        .arg(m_dbPath.toString(), QString::fromUtf8(sqlite3_errmsg(m_db))), Log::CRITICAL);
++                sqlite3_close(m_db);
++                m_db = nullptr;
++                return false;
++            }
++            sqlite3_busy_timeout(m_db, 10'000);
++        }
++
++        const QByteArray statement = u"SELECT %1 FROM %2 WHERE %3 = ?1;"_s
++                .arg(quoted(DB_COLUMN_METADATA.name), quoted(DB_TABLE_TORRENTS), quoted(DB_COLUMN_TORRENT_ID.name)).toUtf8();
++        if (sqlite3_prepare_v2(m_db, statement.constData(), static_cast<int>(statement.size()), &m_statement, nullptr) != SQLITE_OK)
++        {
++            LogMsg(ResumeDataStorage::tr("Couldn't prepare loading piece hashes: %1")
++                    .arg(QString::fromUtf8(sqlite3_errmsg(m_db))), Log::CRITICAL);
++            m_statement = nullptr;
++            return false;
++        }
++        return true;
++    }
++
++    const Path m_dbPath;
++    const int m_bdecodeDepthLimit;
++    const int m_bdecodeTokenLimit;
++
++    std::mutex m_mutex;
++    sqlite3 *m_db = nullptr;
++    sqlite3_stmt *m_statement = nullptr;
++};
++
+ BitTorrent::DBResumeDataStorage::DBResumeDataStorage(const Path &dbPath, QObject *parent)
+     : ResumeDataStorage(dbPath, parent)
++    , m_dbPath {dbPath}
+ {
+     const bool needCreateDB = !dbPath.exists();
+ 
+@@ -269,7 +375,11 @@ BitTorrent::DBResumeDataStorage::DBResumeDataStorage(const Path &dbPath, QObject
+             updateDB(dbVersion);
+     }
+ 
+-    m_asyncWorker = new Worker(dbPath, m_dbLock, this);
++    const auto metadataStoredHandler = [this](const TorrentID &id)
++    {
++        QMetaObject::invokeMethod(this, [this, id] { emit metadataStored(id); }, Qt::QueuedConnection);
++    };
++    m_asyncWorker = new Worker(dbPath, m_dbLock, metadataStoredHandler, this);
+     m_asyncWorker->start();
+ }
+ 
+@@ -280,6 +390,21 @@ BitTorrent::DBResumeDataStorage::~DBResumeDataStorage()
+     QSqlDatabase::removeDatabase(DB_CONNECTION_NAME);
+ }
+ 
++lt::info_section_loader BitTorrent::DBResumeDataStorage::infoSectionLoader() const
++{
++    if (!m_infoSectionReader)
++    {
++        const auto *pref = Preferences::instance();
++        m_infoSectionReader = std::make_shared<InfoSectionReader>(m_dbPath
++                , pref->getBdecodeDepthLimit(), pref->getBdecodeTokenLimit());
++    }
++
++    return [reader = m_infoSectionReader](const lt::info_hash_t &infoHash)
++    {
++        return reader->read(infoHash);
++    };
++}
++
+ QList<BitTorrent::TorrentID> BitTorrent::DBResumeDataStorage::registeredTorrents() const
+ {
+     const auto selectTorrentIDStatement = u"SELECT %1 FROM %2 ORDER BY %3;"_s
+@@ -682,6 +807,7 @@ LoadResumeDataResult DBResumeDataStorage::parseQueryResultRow(const QSqlQuery &q
+         p.ti = std::make_shared<lt::torrent_info>(torentInfoRoot, ec);
+         if (ec)
+             return nonstd::make_unexpected(tr("Cannot parse torrent info: %1").arg(QString::fromStdString(ec.message())));
++        resumeData.metadataStored = true;
+     }
+ 
+     p.save_path = Profile::instance()->fromPortablePath(Path(fromLTString(p.save_path)))
+@@ -698,10 +824,12 @@ LoadResumeDataResult DBResumeDataStorage::parseQueryResultRow(const QSqlQuery &q
+     return resumeData;
+ }
+ 
+-BitTorrent::DBResumeDataStorage::Worker::Worker(const Path &dbPath, QReadWriteLock &dbLock, QObject *parent)
++BitTorrent::DBResumeDataStorage::Worker::Worker(const Path &dbPath, QReadWriteLock &dbLock
++        , MetadataStoredHandler metadataStoredHandler, QObject *parent)
+     : QThread(parent)
+     , m_path {dbPath}
+     , m_dbLock {dbLock}
++    , m_metadataStoredHandler {std::move(metadataStoredHandler)}
+ {
+ }
+ 
+@@ -771,7 +899,7 @@ void DBResumeDataStorage::Worker::requestInterruption()
+ 
+ void BitTorrent::DBResumeDataStorage::Worker::store(const TorrentID &id, const LoadTorrentParams &resumeData)
+ {
+-    addJob(std::make_unique<StoreJob>(id, resumeData));
++    addJob(std::make_unique<StoreJob>(id, resumeData, m_metadataStoredHandler));
+ }
+ 
+ void BitTorrent::DBResumeDataStorage::Worker::remove(const TorrentID &id)
+@@ -797,9 +925,10 @@ namespace
+ {
+     using namespace BitTorrent;
+ 
+-    StoreJob::StoreJob(const TorrentID &torrentID, const LoadTorrentParams &resumeData)
++    StoreJob::StoreJob(const TorrentID &torrentID, const LoadTorrentParams &resumeData, MetadataStoredHandler metadataStoredHandler)
+         : m_torrentID {torrentID}
+         , m_resumeData {resumeData}
++        , m_metadataStoredHandler {std::move(metadataStoredHandler)}
+     {
+     }
+ 
+@@ -925,6 +1054,9 @@ namespace
+ 
+             if (!query.exec())
+                 throw RuntimeError(query.lastError().text());
++
++            if (!bencodedMetadata.isEmpty() && m_metadataStoredHandler)
++                m_metadataStoredHandler(m_torrentID);
+         }
+         catch (const RuntimeError &err)
+         {
+diff --git a/src/base/bittorrent/dbresumedatastorage.h b/src/base/bittorrent/dbresumedatastorage.h
+index a7a97ab..3c1d36a 100644
+--- a/src/base/bittorrent/dbresumedatastorage.h
++++ b/src/base/bittorrent/dbresumedatastorage.h
+@@ -28,6 +28,10 @@
+ 
+ #pragma once
+ 
++#include <memory>
++
++#include <libtorrent/torrent_info.hpp>
++
+ #include <QReadWriteLock>
+ 
+ #include "base/pathfwd.h"
+@@ -53,6 +57,9 @@ namespace BitTorrent
+         void remove(const TorrentID &id) const override;
+         void storeQueue(const QList<TorrentID> &queue) const override;
+ 
++        // reads a torrent's info section from the database, for lt::torrent_info::load_piece_hashes_on_demand()
++        lt::info_section_loader infoSectionLoader() const;
++
+     private:
+         void doLoadAll() const override;
+         int currentDBVersion() const;
+@@ -64,6 +71,10 @@ namespace BitTorrent
+         class Worker;
+         Worker *m_asyncWorker = nullptr;
+ 
++        class InfoSectionReader;
++        const Path m_dbPath;
++        mutable std::shared_ptr<InfoSectionReader> m_infoSectionReader;
++
+         mutable QReadWriteLock m_dbLock;
+     };
+ }
+diff --git a/src/base/bittorrent/loadtorrentparams.h b/src/base/bittorrent/loadtorrentparams.h
+index b84a9eb..bc6f67a 100644
+--- a/src/base/bittorrent/loadtorrentparams.h
++++ b/src/base/bittorrent/loadtorrentparams.h
+@@ -44,6 +44,8 @@ namespace BitTorrent
+     struct LoadTorrentParams
+     {
+         lt::add_torrent_params ltAddTorrentParams {};
++        // the metadata was loaded from the SQLite resume data storage, so its piece hashes can be loaded from there
++        bool metadataStored = false;
+ 
+         QString name;
+         QString category;
+diff --git a/src/base/bittorrent/resumedatastorage.h b/src/base/bittorrent/resumedatastorage.h
+index f2df1b1..3be461e 100644
+--- a/src/base/bittorrent/resumedatastorage.h
++++ b/src/base/bittorrent/resumedatastorage.h
+@@ -70,6 +70,8 @@ namespace BitTorrent
+     signals:
+         void loadStarted(const QList<BitTorrent::TorrentID> &torrents);
+         void loadFinished();
++        // a torrent's metadata was written (SQLite storage only)
++        void metadataStored(const BitTorrent::TorrentID &id);
+ 
+     protected:
+         void onResumeDataLoaded(const TorrentID &torrentID, const LoadResumeDataResult &loadResumeDataResult) const;
+diff --git a/src/base/bittorrent/session.h b/src/base/bittorrent/session.h
+index a22629a..017d945 100644
+--- a/src/base/bittorrent/session.h
++++ b/src/base/bittorrent/session.h
+@@ -463,6 +463,10 @@ namespace BitTorrent
+         virtual void setBannedIPs(const QStringList &newList) = 0;
+         virtual ResumeDataStorageType resumeDataStorageType() const = 0;
+         virtual void setResumeDataStorageType(ResumeDataStorageType type) = 0;
++        virtual bool isPieceHashesOnDemandEnabled() const = 0;
++        virtual void setPieceHashesOnDemandEnabled(bool enabled) = 0;
++        virtual int pieceHashesIdleTime() const = 0;
++        virtual void setPieceHashesIdleTime(int minutes) = 0;
+         virtual bool isMergeTrackersEnabled() const = 0;
+         virtual void setMergeTrackersEnabled(bool enabled) = 0;
+         virtual bool isStartPaused() const = 0;
+diff --git a/src/base/bittorrent/sessionimpl.cpp b/src/base/bittorrent/sessionimpl.cpp
+index dede586..9e227c5 100644
+--- a/src/base/bittorrent/sessionimpl.cpp
++++ b/src/base/bittorrent/sessionimpl.cpp
+@@ -480,6 +480,9 @@ SessionImpl::SessionImpl(QObject *parent)
+     , m_SSRFMitigationEnabled(BITTORRENT_SESSION_KEY(u"SSRFMitigation"_s), true)
+     , m_blockPeersOnPrivilegedPorts(BITTORRENT_SESSION_KEY(u"BlockPeersOnPrivilegedPorts"_s), false)
+     , m_isSeedingOutgoingConnectionsEnabled(BITTORRENT_SESSION_KEY(u"SeedingOutgoingConnections"_s), true)
++    , m_isPieceHashesOnDemandEnabled(BITTORRENT_SESSION_KEY(u"PieceHashesOnDemand"_s), true)
++    , m_pieceHashesIdleTime(BITTORRENT_SESSION_KEY(u"PieceHashesIdleTime"_s), 15
++            , [](const int minutes) { return std::max(1, minutes); })
+     , m_isAddTrackersEnabled(BITTORRENT_SESSION_KEY(u"AddTrackersEnabled"_s), false)
+     , m_additionalTrackers(BITTORRENT_SESSION_KEY(u"AdditionalTrackers"_s))
+     , m_libtorrentSettingsOverride(BITTORRENT_SESSION_KEY(u"LibtorrentSettingsOverride"_s))
+@@ -1327,7 +1330,10 @@ void SessionImpl::prepareStartup()
+ 
+     if (context->currentStorageType == ResumeDataStorageType::SQLite)
+     {
+-        m_resumeDataStorage = new DBResumeDataStorage(dbPath, this);
++        auto *dbStorage = new DBResumeDataStorage(dbPath, this);
++        m_resumeDataStorage = dbStorage;
++        if (m_isPieceHashesOnDemandEnabled)
++            enablePieceHashesOnDemand(dbStorage);
+ 
+         if (!dbStorageExists)
+         {
+@@ -1583,6 +1589,12 @@ void SessionImpl::processNextResumeData(ResumeSessionContext *context)
+     resumeData.ltAddTorrentParams.storage = customStorageConstructor;
+ #endif
+ 
++    // only the storage the torrent is saved to from now on can be asked for its piece hashes
++    if (context->startupStorage != m_resumeDataStorage)
++        resumeData.metadataStored = false;
++    if (m_infoSectionLoader && resumeData.metadataStored && resumeData.ltAddTorrentParams.ti)
++        resumeData.ltAddTorrentParams.ti->load_piece_hashes_on_demand(m_infoSectionLoader, false);
++
+     qDebug() << "Starting up torrent" << torrentID.toString() << "...";
+     m_loadingTorrents.insert(torrentID, resumeData);
+ #ifdef QBT_USES_LIBTORRENT2
+@@ -3046,6 +3058,14 @@ bool SessionImpl::addTorrent_impl(const TorrentDescriptor &source, const AddTorr
+     p.storage = customStorageConstructor;
+ #endif
+ 
++    if (m_infoSectionLoader && p.ti)
++    {
++        // A copy, as the source's metadata may be shared. Its piece hashes stay loaded until the metadata is
++        // stored (see TorrentImpl::releaseUnusedPieceHashes()).
++        p.ti = std::make_shared<lt::torrent_info>(*p.ti);
++        p.ti->load_piece_hashes_on_demand(m_infoSectionLoader, true);
++    }
++
+     m_loadingTorrents.insert(id, loadTorrentParams);
+     if (infoHash.isHybrid())
+         m_hybridTorrentsByAltID.insert(altID, nullptr);
+@@ -5499,6 +5519,57 @@ void SessionImpl::handleTorrentFinished(TorrentImpl *const torrent)
+     m_pendingFinishedTorrents.append(torrent);
+ }
+ 
++// takes effect when the session starts (torrents are loaded with their hashes or without)
++bool SessionImpl::isPieceHashesOnDemandEnabled() const
++{
++    return m_isPieceHashesOnDemandEnabled;
++}
++
++void SessionImpl::setPieceHashesOnDemandEnabled(const bool enabled)
++{
++    m_isPieceHashesOnDemandEnabled = enabled;
++}
++
++int SessionImpl::pieceHashesIdleTime() const
++{
++    return m_pieceHashesIdleTime;
++}
++
++void SessionImpl::setPieceHashesIdleTime(const int minutes)
++{
++    m_pieceHashesIdleTime = std::max(1, minutes);
++}
++
++void SessionImpl::enablePieceHashesOnDemand(const DBResumeDataStorage *storage)
++{
++    m_infoSectionLoader = storage->infoSectionLoader();
++    connect(storage, &ResumeDataStorage::metadataStored, this, [this](const TorrentID &id)
++    {
++        if (TorrentImpl *torrent = m_torrents.value(id))
++            torrent->setMetadataStored();
++    });
++
++    m_pieceHashesReleaseTimer = new QTimer(this);
++    connect(m_pieceHashesReleaseTimer, &QTimer::timeout, this, &SessionImpl::releaseUnusedPieceHashes);
++    m_pieceHashesReleaseTimer->start(1min);
++
++    LogMsg(tr("Piece hashes of idle torrents are loaded from the resume data database when needed. Idle time: %1 minutes")
++            .arg(m_pieceHashesIdleTime.get()));
++}
++
++void SessionImpl::releaseUnusedPieceHashes()
++{
++    const std::chrono::minutes idleTime {m_pieceHashesIdleTime.get()};
++    int releasedCount = 0;
++    for (TorrentImpl *torrent : asConst(m_torrents))
++    {
++        if (torrent->releaseUnusedPieceHashes(idleTime))
++            ++releasedCount;
++    }
++    if (releasedCount > 0)
++        qDebug("Released the piece hashes of %d torrents", releasedCount);
++}
++
+ void SessionImpl::handleTorrentResumeDataReady(TorrentImpl *const torrent, const LoadTorrentParams &data)
+ {
+     m_resumeDataStorage->store(torrent->id(), data);
+diff --git a/src/base/bittorrent/sessionimpl.h b/src/base/bittorrent/sessionimpl.h
+index e54eabe..769fa82 100644
+--- a/src/base/bittorrent/sessionimpl.h
++++ b/src/base/bittorrent/sessionimpl.h
+@@ -36,6 +36,7 @@
+ #include <libtorrent/fwd.hpp>
+ #include <libtorrent/portmap.hpp>
+ #include <libtorrent/torrent_handle.hpp>
++#include <libtorrent/torrent_info.hpp>
+ 
+ #include <QtContainerFwd>
+ #include <QElapsedTimer>
+@@ -71,6 +72,7 @@ namespace BitTorrent
+     enum class MoveStorageMode;
+     enum class MoveStorageContext;
+ 
++    class DBResumeDataStorage;
+     class InfoHash;
+     class ResumeDataStorage;
+     class Torrent;
+@@ -430,6 +432,10 @@ namespace BitTorrent
+         QStringList bannedIPs() const override;
+         void setBannedIPs(const QStringList &newList) override;
+         ResumeDataStorageType resumeDataStorageType() const override;
++        bool isPieceHashesOnDemandEnabled() const override;
++        void setPieceHashesOnDemandEnabled(bool enabled) override;
++        int pieceHashesIdleTime() const override;
++        void setPieceHashesIdleTime(int minutes) override;
+         void setResumeDataStorageType(ResumeDataStorageType type) override;
+         bool isMergeTrackersEnabled() const override;
+         void setMergeTrackersEnabled(bool enabled) override;
+@@ -573,6 +579,8 @@ namespace BitTorrent
+         void enableTracker(bool enable);
+         void enableBandwidthScheduler();
+         void populateAdditionalTrackers();
++        void enablePieceHashesOnDemand(const DBResumeDataStorage *storage);
++        void releaseUnusedPieceHashes();
+         void enableIPFilter();
+         void disableIPFilter();
+         void processTorrentShareLimits(TorrentImpl *torrent);
+@@ -719,6 +727,8 @@ namespace BitTorrent
+         CachedSettingValue<bool> m_SSRFMitigationEnabled;
+         CachedSettingValue<bool> m_blockPeersOnPrivilegedPorts;
+         CachedSettingValue<bool> m_isSeedingOutgoingConnectionsEnabled;
++        CachedSettingValue<bool> m_isPieceHashesOnDemandEnabled;
++        CachedSettingValue<int> m_pieceHashesIdleTime;
+         CachedSettingValue<bool> m_isAddTrackersEnabled;
+         CachedSettingValue<QString> m_additionalTrackers;
+         CachedSettingValue<QString> m_libtorrentSettingsOverride;
+@@ -833,6 +843,9 @@ namespace BitTorrent
+         Utils::Thread::UniquePtr m_ioThread;
+         QThreadPool *m_asyncWorker = nullptr;
+         ResumeDataStorage *m_resumeDataStorage = nullptr;
++        // set while the piece hashes of seeds are loaded from the SQLite resume data storage on demand
++        lt::info_section_loader m_infoSectionLoader;
++        QTimer *m_pieceHashesReleaseTimer = nullptr;
+         FileSearcher *m_fileSearcher = nullptr;
+         TorrentContentRemover *m_torrentContentRemover = nullptr;
+ 
+diff --git a/src/base/bittorrent/torrentimpl.cpp b/src/base/bittorrent/torrentimpl.cpp
+index c39999b..b82533a 100644
+--- a/src/base/bittorrent/torrentimpl.cpp
++++ b/src/base/bittorrent/torrentimpl.cpp
+@@ -324,6 +324,7 @@ TorrentImpl::TorrentImpl(SessionImpl *session, lt::session *nativeSession
+     , m_ltAddTorrentParams(params.ltAddTorrentParams)
+     , m_downloadLimit(cleanLimitValue(m_ltAddTorrentParams.download_limit))
+     , m_uploadLimit(cleanLimitValue(m_ltAddTorrentParams.upload_limit))
++    , m_metadataStored(params.metadataStored)
+ {
+     if (m_ltAddTorrentParams.ti)
+     {
+@@ -2772,6 +2773,21 @@ void TorrentImpl::expandResumeProgress()
+         m_ltAddTorrentParams.have_pieces.resize(m_torrentInfo.piecesCount(), true);
+ }
+ 
++void TorrentImpl::setMetadataStored()
++{
++    m_metadataStored = true;
++}
++
++bool TorrentImpl::releaseUnusedPieceHashes(const lt::time_duration idleTime) const
++{
++    if (!m_metadataStored || !hasMetadata())
++        return false;
++    if (isDownloading() || isChecking() || isMoving())
++        return false;
++
++    return m_torrentInfo.nativeInfo()->release_unused_piece_hashes(idleTime);
++}
++
+ void TorrentImpl::setRatioLimit(qreal limit)
+ {
+     if (limit < USE_GLOBAL_RATIO)
+diff --git a/src/base/bittorrent/torrentimpl.h b/src/base/bittorrent/torrentimpl.h
+index b296ad5..28b536a 100644
+--- a/src/base/bittorrent/torrentimpl.h
++++ b/src/base/bittorrent/torrentimpl.h
+@@ -270,6 +270,12 @@ namespace BitTorrent
+         lt::torrent_handle nativeHandle() const;
+ 
+         void handleAlert(const lt::alert *a);
++
++        // the metadata is in the SQLite resume data storage, so its piece hashes can be loaded from there
++        void setMetadataStored();
++        // frees the piece hashes if they are loaded on demand, have not been used for idleTime (see
++        // lt::torrent_info::release_unused_piece_hashes()) and the torrent does not need them soon
++        bool releaseUnusedPieceHashes(lt::time_duration idleTime) const;
+         void handleStateUpdate(const lt::torrent_status &nativeStatus);
+         void handleQueueingModeChanged();
+         void handleCategoryOptionsChanged();
+@@ -395,6 +401,8 @@ namespace BitTorrent
+ 
+         int m_downloadLimit = 0;
+         int m_uploadLimit = 0;
++        // the metadata is in the SQLite resume data storage (piece hashes can be loaded from there)
++        bool m_metadataStored = false;
+ 
+         // A seed's piece bitfields are all ones: they are kept as these flags instead of one bitfield per
+         // torrent (m_pieces is empty while m_hasAllPieces, m_ltAddTorrentParams.have_pieces while
+diff --git a/src/webui/api/appcontroller.cpp b/src/webui/api/appcontroller.cpp
+index 7f099b3..eb0b397 100644
+--- a/src/webui/api/appcontroller.cpp
++++ b/src/webui/api/appcontroller.cpp
+@@ -365,6 +365,8 @@ void AppController::preferencesAction()
+     // qBitorrent preferences
+     // Resume data storage type
+     data[u"resume_data_storage_type"_s] = Utils::String::fromEnum(session->resumeDataStorageType());
++    data[u"piece_hashes_on_demand"_s] = session->isPieceHashesOnDemandEnabled();
++    data[u"piece_hashes_idle_time"_s] = session->pieceHashesIdleTime();
+     // Torrent content removing mode
+     data[u"torrent_content_remove_option"_s] = Utils::String::fromEnum(session->torrentContentRemoveOption());
+     // Physical memory (RAM) usage limit
+@@ -975,6 +977,10 @@ void AppController::setPreferencesAction()
+     // Resume data storage type
+     if (hasKey(u"resume_data_storage_type"_s))
+         session->setResumeDataStorageType(Utils::String::toEnum(it.value().toString(), BitTorrent::ResumeDataStorageType::Legacy));
++    if (hasKey(u"piece_hashes_on_demand"_s))
++        session->setPieceHashesOnDemandEnabled(it.value().toBool());
++    if (hasKey(u"piece_hashes_idle_time"_s))
++        session->setPieceHashesIdleTime(it.value().toInt());
+     // Torrent content removing mode
+     if (hasKey(u"torrent_content_remove_option"_s))
+         session->setTorrentContentRemoveOption(Utils::String::toEnum(it.value().toString(), BitTorrent::TorrentContentRemoveOption::MoveToTrash));
+diff --git a/src/webui/www/private/views/preferences.html b/src/webui/www/private/views/preferences.html
+index 62f2137..fa3f9c4 100644
+--- a/src/webui/www/private/views/preferences.html
++++ b/src/webui/www/private/views/preferences.html
+@@ -1143,6 +1143,22 @@ Use ';' to split multiple entries. Can use wildcard '*'.)QBT_TR[CONTEXT=OptionsD
+                         </select>
+                     </td>
+                 </tr>
++                <tr>
++                    <td>
++                        <label for="pieceHashesOnDemand">QBT_TR(Load piece hashes of idle torrents from the database when needed (SQLite, requires restart):)QBT_TR[CONTEXT=OptionsDialog]</label>
++                    </td>
++                    <td>
++                        <input type="checkbox" id="pieceHashesOnDemand">
++                    </td>
++                </tr>
++                <tr>
++                    <td>
++                        <label for="pieceHashesIdleTime">QBT_TR(Free piece hashes unused for (minutes):)QBT_TR[CONTEXT=OptionsDialog]</label>
++                    </td>
++                    <td>
++                        <input type="text" id="pieceHashesIdleTime" style="width: 15em;">
++                    </td>
++                </tr>
+                 <tr id="rowTorrentContentRemoveOption">
+                     <td>
+                         <label for="torrentContentRemoveOption">QBT_TR(Torrent content removing mode:)QBT_TR[CONTEXT=OptionsDialog]</label>
+@@ -2629,6 +2645,8 @@ Use ';' to split multiple entries. Can use wildcard '*'.)QBT_TR[CONTEXT=OptionsD
+                     // Advanced settings
+                     // qBittorrent section
+                     $("resumeDataStorageType").value = pref.resume_data_storage_type;
++                    $("pieceHashesOnDemand").checked = pref.piece_hashes_on_demand;
++                    $("pieceHashesIdleTime").value = pref.piece_hashes_idle_time;
+                     $("torrentContentRemoveOption").value = pref.torrent_content_remove_option;
+                     $("memoryWorkingSetLimit").value = pref.memory_working_set_limit;
+                     updateNetworkInterfaces(pref.current_network_interface, pref.current_interface_name);
+@@ -3108,6 +3126,8 @@ Use ';' to split multiple entries. Can use wildcard '*'.)QBT_TR[CONTEXT=OptionsD
+             // Update advanced settings
+             // qBittorrent section
+             settings["resume_data_storage_type"] = $("resumeDataStorageType").value;
++            settings["piece_hashes_on_demand"] = $("pieceHashesOnDemand").checked;
++            settings["piece_hashes_idle_time"] = Number($("pieceHashesIdleTime").value);
+             settings["torrent_content_remove_option"] = $("torrentContentRemoveOption").value;
+             settings["memory_working_set_limit"] = Number($("memoryWorkingSetLimit").value);
+             settings["current_network_interface"] = $("networkInterface").value;
+-- 
+2.47.3
+

@@ -1,0 +1,572 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anonymous <anonymous@localhost>
+Date: Thu, 01 Oct 2026 22:24:29 +0000
+Subject: [PATCH 2/3] WebAPI: write maindata and torrent list JSON directly
+
+sync/maindata and torrents/info built their responses as QVariantMaps, then
+converted every map to a QJsonObject (in Qt 6 a CBOR container, so every value
+and key is copied into a growing buffer) and finally wrote the JSON text. With
+thousands of torrents that conversion took most of the request time.
+
+JsonWriter writes the same compact JSON straight from the QVariant containers.
+Escaping and number formatting match QJsonDocument; only the order of keys
+coming from QHash containers may differ. Value types without a fast path go
+through QJsonValue::fromVariant() as before.
+---
+ src/webui/CMakeLists.txt               |   2 +
+ src/webui/api/serialize/jsonwriter.cpp | 271 +++++++++++++++++++++++++
+ src/webui/api/serialize/jsonwriter.h   |  81 ++++++++
+ src/webui/api/synccontroller.cpp       |  73 +++----
+ src/webui/api/synccontroller.h         |   2 +-
+ src/webui/api/torrentscontroller.cpp   |   7 +-
+ 6 files changed, 393 insertions(+), 43 deletions(-)
+ create mode 100644 src/webui/api/serialize/jsonwriter.cpp
+ create mode 100644 src/webui/api/serialize/jsonwriter.h
+
+diff --git a/src/webui/CMakeLists.txt b/src/webui/CMakeLists.txt
+index 9dfc128..2883dd3 100644
+--- a/src/webui/CMakeLists.txt
++++ b/src/webui/CMakeLists.txt
+@@ -12,6 +12,7 @@ add_library(qbt_webui STATIC
+     api/torrentcreatorcontroller.h
+     api/torrentscontroller.h
+     api/transfercontroller.h
++    api/serialize/jsonwriter.h
+     api/serialize/serialize_torrent.h
+     freediskspacechecker.h
+     webapplication.h
+@@ -29,6 +30,7 @@ add_library(qbt_webui STATIC
+     api/torrentcreatorcontroller.cpp
+     api/torrentscontroller.cpp
+     api/transfercontroller.cpp
++    api/serialize/jsonwriter.cpp
+     api/serialize/serialize_torrent.cpp
+     freediskspacechecker.cpp
+     webapplication.cpp
+diff --git a/src/webui/api/serialize/jsonwriter.cpp b/src/webui/api/serialize/jsonwriter.cpp
+new file mode 100644
+index 0000000..b825e4f
+--- /dev/null
++++ b/src/webui/api/serialize/jsonwriter.cpp
+@@ -0,0 +1,271 @@
++/*
++ * Bittorrent Client using Qt and libtorrent.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
++ *
++ * In addition, as a special exception, the copyright holders give permission to
++ * link this program with the OpenSSL project's "OpenSSL" library (or with
++ * modified versions of it that use the same license as the "OpenSSL" library),
++ * and distribute the linked executables. You must obey the GNU General Public
++ * License in all respects for all of the code used other than "OpenSSL".  If you
++ * modify file(s), you may extend this exception to your version of the file(s),
++ * but you are not obligated to do so. If you do not wish to do so, delete this
++ * exception statement from your version.
++ */
++
++#include "jsonwriter.h"
++
++#include <charconv>
++#include <cmath>
++#include <limits>
++
++#include <QJsonArray>
++#include <QJsonDocument>
++#include <QJsonValue>
++#include <QLocale>
++
++namespace
++{
++    char hexDigit(const uint value)
++    {
++        return static_cast<char>((value < 0xA) ? ('0' + value) : ('a' + value - 0xA));
++    }
++
++    void appendInteger(QByteArray &out, const qint64 value)
++    {
++        char buffer[24];
++        const auto result = std::to_chars(std::begin(buffer), std::end(buffer), value);
++        out.append(buffer, (result.ptr - buffer));
++    }
++
++    void appendDouble(QByteArray &out, const double value)
++    {
++        // RFC 8259 has no representation for NaN or infinity, QJsonDocument writes null as well
++        if (std::isfinite(value))
++            out.append(QByteArray::number(value, 'g', QLocale::FloatingPointShortest));
++        else
++            out.append("null");
++    }
++
++    // Values of types this writer has no fast path for go through Qt's own conversion,
++    // so the output stays what QJsonDocument would produce.
++    void appendViaQJson(QByteArray &out, const QVariant &value)
++    {
++        const QByteArray json = QJsonDocument(QJsonArray {QJsonValue::fromVariant(value)}).toJson(QJsonDocument::Compact);
++        out.append(QByteArrayView(json).sliced(1, (json.size() - 2)));  // strip the enclosing [ ]
++    }
++}
++
++void JsonWriter::appendString(QByteArray &out, const QStringView str)
++{
++    // Same escaping as QJsonDocument: ", \ and control characters are escaped, everything else is
++    // written as UTF-8 and unpaired surrogates become \uXXXX. Worst case is 6 bytes per UTF-16 unit.
++    const qsizetype start = out.size();
++    out.resize(start + (str.size() * 6) + 2);
++    char *cursor = out.data() + start;
++
++    *cursor++ = '"';
++    const char16_t *src = str.utf16();
++    const char16_t *const end = src + str.size();
++    while (src != end)
++    {
++        const char16_t u = *src++;
++        if (u < 0x80)
++        {
++            if ((u >= 0x20) && (u != u'"') && (u != u'\\'))
++            {
++                *cursor++ = static_cast<char>(u);
++                continue;
++            }
++
++            *cursor++ = '\\';
++            switch (u)
++            {
++            case u'"':
++                *cursor++ = '"';
++                break;
++            case u'\\':
++                *cursor++ = '\\';
++                break;
++            case 0x8:
++                *cursor++ = 'b';
++                break;
++            case 0xC:
++                *cursor++ = 'f';
++                break;
++            case 0xA:
++                *cursor++ = 'n';
++                break;
++            case 0xD:
++                *cursor++ = 'r';
++                break;
++            case 0x9:
++                *cursor++ = 't';
++                break;
++            default:
++                *cursor++ = 'u';
++                *cursor++ = '0';
++                *cursor++ = '0';
++                *cursor++ = hexDigit(u >> 4);
++                *cursor++ = hexDigit(u & 0xF);
++                break;
++            }
++        }
++        else if (u < 0x800)
++        {
++            *cursor++ = static_cast<char>(0xC0 | (u >> 6));
++            *cursor++ = static_cast<char>(0x80 | (u & 0x3F));
++        }
++        else if (!QChar::isSurrogate(u))
++        {
++            *cursor++ = static_cast<char>(0xE0 | (u >> 12));
++            *cursor++ = static_cast<char>(0x80 | ((u >> 6) & 0x3F));
++            *cursor++ = static_cast<char>(0x80 | (u & 0x3F));
++        }
++        else if (QChar::isHighSurrogate(u) && (src != end) && QChar::isLowSurrogate(*src))
++        {
++            const char32_t ucs4 = QChar::surrogateToUcs4(u, *src++);
++            *cursor++ = static_cast<char>(0xF0 | (ucs4 >> 18));
++            *cursor++ = static_cast<char>(0x80 | ((ucs4 >> 12) & 0x3F));
++            *cursor++ = static_cast<char>(0x80 | ((ucs4 >> 6) & 0x3F));
++            *cursor++ = static_cast<char>(0x80 | (ucs4 & 0x3F));
++        }
++        else
++        {
++            *cursor++ = '\\';
++            *cursor++ = 'u';
++            *cursor++ = hexDigit((u >> 12) & 0xF);
++            *cursor++ = hexDigit((u >> 8) & 0xF);
++            *cursor++ = hexDigit((u >> 4) & 0xF);
++            *cursor++ = hexDigit(u & 0xF);
++        }
++    }
++    *cursor++ = '"';
++
++    out.truncate(cursor - out.constData());
++}
++
++void JsonWriter::appendValue(QByteArray &out, const QVariant &value)
++{
++    // Type mapping follows QCborValue::fromVariant(), which QJsonValue::fromVariant() uses
++    switch (value.metaType().id())
++    {
++    case QMetaType::UnknownType:
++    case QMetaType::Nullptr:
++        out.append("null");
++        break;
++    case QMetaType::Bool:
++        out.append(value.toBool() ? "true" : "false");
++        break;
++    case QMetaType::Short:
++    case QMetaType::UShort:
++    case QMetaType::Int:
++    case QMetaType::UInt:
++    case QMetaType::Long:
++    case QMetaType::LongLong:
++        appendInteger(out, value.toLongLong());
++        break;
++    case QMetaType::ULong:
++    case QMetaType::ULongLong:
++        if (const qulonglong number = value.toULongLong(); number <= static_cast<qulonglong>(std::numeric_limits<qint64>::max()))
++            appendInteger(out, static_cast<qint64>(number));
++        else
++            appendDouble(out, value.toDouble());
++        break;
++    case QMetaType::Float:
++    case QMetaType::Double:
++        appendDouble(out, value.toDouble());
++        break;
++    case QMetaType::QString:
++        appendString(out, value.toString());
++        break;
++    case QMetaType::QStringList:
++        appendStringList(out, value.toStringList());
++        break;
++    case QMetaType::QVariantList:
++        appendList(out, value.toList());
++        break;
++    case QMetaType::QVariantMap:
++        appendMap(out, value.toMap());
++        break;
++    case QMetaType::QVariantHash:
++        appendHash(out, value.toHash(), &JsonWriter::appendValue);
++        break;
++    default:
++        appendViaQJson(out, value);
++        break;
++    }
++}
++
++void JsonWriter::appendMap(QByteArray &out, const QVariantMap &map)
++{
++    out.append('{');
++    bool first = true;
++    for (auto it = map.cbegin(); it != map.cend(); ++it)
++    {
++        if (!first)
++            out.append(',');
++        first = false;
++        appendString(out, it.key());
++        out.append(':');
++        appendValue(out, it.value());
++    }
++    out.append('}');
++}
++
++void JsonWriter::appendList(QByteArray &out, const QVariantList &list)
++{
++    out.append('[');
++    for (qsizetype i = 0; i < list.size(); ++i)
++    {
++        if (i > 0)
++            out.append(',');
++        appendValue(out, list[i]);
++    }
++    out.append(']');
++}
++
++void JsonWriter::appendStringList(QByteArray &out, const QStringList &list)
++{
++    out.append('[');
++    for (qsizetype i = 0; i < list.size(); ++i)
++    {
++        if (i > 0)
++            out.append(',');
++        appendString(out, list[i]);
++    }
++    out.append(']');
++}
++
++JsonWriter::ObjectWriter::ObjectWriter(QByteArray &out)
++    : m_out {out}
++{
++    m_out.append('{');
++}
++
++JsonWriter::ObjectWriter::~ObjectWriter()
++{
++    m_out.append('}');
++}
++
++QByteArray &JsonWriter::ObjectWriter::key(const QStringView name)
++{
++    if (!m_first)
++        m_out.append(',');
++    m_first = false;
++    appendString(m_out, name);
++    m_out.append(':');
++    return m_out;
++}
+diff --git a/src/webui/api/serialize/jsonwriter.h b/src/webui/api/serialize/jsonwriter.h
+new file mode 100644
+index 0000000..5bd3a01
+--- /dev/null
++++ b/src/webui/api/serialize/jsonwriter.h
+@@ -0,0 +1,81 @@
++/*
++ * Bittorrent Client using Qt and libtorrent.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
++ *
++ * In addition, as a special exception, the copyright holders give permission to
++ * link this program with the OpenSSL project's "OpenSSL" library (or with
++ * modified versions of it that use the same license as the "OpenSSL" library),
++ * and distribute the linked executables. You must obey the GNU General Public
++ * License in all respects for all of the code used other than "OpenSSL".  If you
++ * modify file(s), you may extend this exception to your version of the file(s),
++ * but you are not obligated to do so. If you do not wish to do so, delete this
++ * exception statement from your version.
++ */
++
++#pragma once
++
++#include <QByteArray>
++#include <QHash>
++#include <QString>
++#include <QStringList>
++#include <QVariant>
++
++// Writes compact JSON straight from the QVariant containers the WebAPI builds, without
++// converting them to QJsonObject/QJsonArray first. The output is what
++// QJsonDocument::fromVariant(...).toJson(QJsonDocument::Compact) produces for the same
++// data (same escaping and number formatting); only the order of QHash keys may differ.
++namespace JsonWriter
++{
++    void appendString(QByteArray &out, QStringView str);
++    void appendValue(QByteArray &out, const QVariant &value);
++    void appendMap(QByteArray &out, const QVariantMap &map);
++    void appendList(QByteArray &out, const QVariantList &list);
++    void appendStringList(QByteArray &out, const QStringList &list);
++
++    template <typename Value, typename Writer>
++    void appendHash(QByteArray &out, const QHash<QString, Value> &hash, Writer writeValue)
++    {
++        out.append('{');
++        bool first = true;
++        for (auto it = hash.cbegin(); it != hash.cend(); ++it)
++        {
++            if (!first)
++                out.append(',');
++            first = false;
++            appendString(out, it.key());
++            out.append(':');
++            writeValue(out, it.value());
++        }
++        out.append('}');
++    }
++
++    // Writes the members of one object: `{` on construction, `}` on destruction.
++    class ObjectWriter
++    {
++    public:
++        explicit ObjectWriter(QByteArray &out);
++        ~ObjectWriter();
++
++        // Writes the separator and `"key":`, then returns the buffer for the value.
++        QByteArray &key(QStringView name);
++
++    private:
++        Q_DISABLE_COPY_MOVE(ObjectWriter)
++
++        QByteArray &m_out;
++        bool m_first = true;
++    };
++}
+diff --git a/src/webui/api/synccontroller.cpp b/src/webui/api/synccontroller.cpp
+index 96ef9dd..d8fe6be 100644
+--- a/src/webui/api/synccontroller.cpp
++++ b/src/webui/api/synccontroller.cpp
+@@ -43,10 +43,12 @@
+ #include "base/bittorrent/torrentinfo.h"
+ #include "base/bittorrent/trackerentrystatus.h"
+ #include "base/global.h"
++#include "base/http/types.h"
+ #include "base/net/geoipmanager.h"
+ #include "base/preferences.h"
+ #include "base/utils/string.h"
+ #include "apierror.h"
++#include "serialize/jsonwriter.h"
+ #include "serialize/serialize_torrent.h"
+ 
+ namespace
+@@ -507,7 +509,7 @@ void SyncController::maindataAction()
+     }
+ 
+     const int id = (m_maindataLastSentID % 1000000) + 1;  // cycle between 1 and 1000000
+-    setResult(generateMaindataSyncData(id, fullUpdate));
++    setResult(generateMaindataSyncData(id, fullUpdate), Http::CONTENT_TYPE_JSON);
+     m_maindataLastSentID = id;
+ }
+ 
+@@ -563,7 +565,7 @@ void SyncController::makeMaindataSnapshot()
+     m_maindataSnapshot.serverState[KEY_SYNC_MAINDATA_USE_SUBCATEGORIES] = session->isSubcategoriesEnabled();
+ }
+ 
+-QJsonObject SyncController::generateMaindataSyncData(const int id, const bool fullUpdate)
++QByteArray SyncController::generateMaindataSyncData(const int id, const bool fullUpdate)
+ {
+     // if need to update existing sync data
+     for (const QString &category : asConst(m_updatedCategories))
+@@ -683,51 +685,40 @@ QJsonObject SyncController::generateMaindataSyncData(const int id, const bool fu
+         m_maindataSnapshot.serverState = serverState;
+     }
+ 
+-    QJsonObject syncData;
+-    syncData[KEY_RESPONSE_ID] = id;
+-    if (fullUpdate)
++    QByteArray syncData;
++    syncData.reserve(fullUpdate ? (m_maindataSyncBuf.torrents.size() * 2048) : 4096);
+     {
+-        m_maindataSyncBuf = m_maindataSnapshot;
+-        syncData[KEY_FULL_UPDATE] = true;
+-    }
++        JsonWriter::ObjectWriter syncObject {syncData};
++        JsonWriter::appendValue(syncObject.key(KEY_RESPONSE_ID), id);
++        if (fullUpdate)
++        {
++            m_maindataSyncBuf = m_maindataSnapshot;
++            JsonWriter::appendValue(syncObject.key(KEY_FULL_UPDATE), true);
++        }
+ 
+-    if (!m_maindataSyncBuf.categories.isEmpty())
+-    {
+-        QJsonObject categories;
+-        for (auto it = m_maindataSyncBuf.categories.cbegin(); it != m_maindataSyncBuf.categories.cend(); ++it)
+-            categories[it.key()] = QJsonObject::fromVariantMap(it.value());
+-        syncData[KEY_CATEGORIES] = categories;
+-    }
+-    if (!m_maindataSyncBuf.removedCategories.isEmpty())
+-        syncData[KEY_CATEGORIES_REMOVED] = QJsonArray::fromStringList(m_maindataSyncBuf.removedCategories);
++        if (!m_maindataSyncBuf.categories.isEmpty())
++            JsonWriter::appendHash(syncObject.key(KEY_CATEGORIES), m_maindataSyncBuf.categories, &JsonWriter::appendMap);
++        if (!m_maindataSyncBuf.removedCategories.isEmpty())
++            JsonWriter::appendStringList(syncObject.key(KEY_CATEGORIES_REMOVED), m_maindataSyncBuf.removedCategories);
+ 
+-    if (!m_maindataSyncBuf.tags.isEmpty())
+-        syncData[KEY_TAGS] = QJsonArray::fromVariantList(m_maindataSyncBuf.tags);
+-    if (!m_maindataSyncBuf.removedTags.isEmpty())
+-        syncData[KEY_TAGS_REMOVED] = QJsonArray::fromStringList(m_maindataSyncBuf.removedTags);
++        if (!m_maindataSyncBuf.tags.isEmpty())
++            JsonWriter::appendList(syncObject.key(KEY_TAGS), m_maindataSyncBuf.tags);
++        if (!m_maindataSyncBuf.removedTags.isEmpty())
++            JsonWriter::appendStringList(syncObject.key(KEY_TAGS_REMOVED), m_maindataSyncBuf.removedTags);
+ 
+-    if (!m_maindataSyncBuf.torrents.isEmpty())
+-    {
+-        QJsonObject torrents;
+-        for (auto it = m_maindataSyncBuf.torrents.cbegin(); it != m_maindataSyncBuf.torrents.cend(); ++it)
+-            torrents[it.key()] = QJsonObject::fromVariantMap(it.value());
+-        syncData[KEY_TORRENTS] = torrents;
+-    }
+-    if (!m_maindataSyncBuf.removedTorrents.isEmpty())
+-        syncData[KEY_TORRENTS_REMOVED] = QJsonArray::fromStringList(m_maindataSyncBuf.removedTorrents);
++        if (!m_maindataSyncBuf.torrents.isEmpty())
++            JsonWriter::appendHash(syncObject.key(KEY_TORRENTS), m_maindataSyncBuf.torrents, &JsonWriter::appendMap);
++        if (!m_maindataSyncBuf.removedTorrents.isEmpty())
++            JsonWriter::appendStringList(syncObject.key(KEY_TORRENTS_REMOVED), m_maindataSyncBuf.removedTorrents);
+ 
+-    if (!m_maindataSyncBuf.trackers.isEmpty())
+-    {
+-        QJsonObject trackers;
+-        for (auto it = m_maindataSyncBuf.trackers.cbegin(); it != m_maindataSyncBuf.trackers.cend(); ++it)
+-            trackers[it.key()] = QJsonArray::fromStringList(it.value());
+-        syncData[KEY_TRACKERS] = trackers;
+-    }
+-    if (!m_maindataSyncBuf.removedTrackers.isEmpty())
+-        syncData[KEY_TRACKERS_REMOVED] = QJsonArray::fromStringList(m_maindataSyncBuf.removedTrackers);
++        if (!m_maindataSyncBuf.trackers.isEmpty())
++            JsonWriter::appendHash(syncObject.key(KEY_TRACKERS), m_maindataSyncBuf.trackers, &JsonWriter::appendStringList);
++        if (!m_maindataSyncBuf.removedTrackers.isEmpty())
++            JsonWriter::appendStringList(syncObject.key(KEY_TRACKERS_REMOVED), m_maindataSyncBuf.removedTrackers);
+ 
+-    if (!m_maindataSyncBuf.serverState.isEmpty())
+-        syncData[KEY_SERVER_STATE] = QJsonObject::fromVariantMap(m_maindataSyncBuf.serverState);
++        if (!m_maindataSyncBuf.serverState.isEmpty())
++            JsonWriter::appendMap(syncObject.key(KEY_SERVER_STATE), m_maindataSyncBuf.serverState);
++    }
+ 
+     return syncData;
+ }
+diff --git a/src/webui/api/synccontroller.h b/src/webui/api/synccontroller.h
+index af22238..b6af285 100644
+--- a/src/webui/api/synccontroller.h
++++ b/src/webui/api/synccontroller.h
+@@ -59,7 +59,7 @@ private slots:
+ 
+ private:
+     void makeMaindataSnapshot();
+-    QJsonObject generateMaindataSyncData(int id, bool fullUpdate);
++    QByteArray generateMaindataSyncData(int id, bool fullUpdate);
+ 
+     void onCategoryAdded(const QString &categoryName);
+     void onCategoryRemoved(const QString &categoryName);
+diff --git a/src/webui/api/torrentscontroller.cpp b/src/webui/api/torrentscontroller.cpp
+index 39e5368..c19784f 100644
+--- a/src/webui/api/torrentscontroller.cpp
++++ b/src/webui/api/torrentscontroller.cpp
+@@ -52,6 +52,7 @@
+ #include "base/bittorrent/trackerentrystatus.h"
+ #include "base/interfaces/iapplication.h"
+ #include "base/global.h"
++#include "base/http/types.h"
+ #include "base/logger.h"
+ #include "base/torrentfilter.h"
+ #include "base/utils/datetime.h"
+@@ -59,6 +60,7 @@
+ #include "base/utils/sslkey.h"
+ #include "base/utils/string.h"
+ #include "apierror.h"
++#include "serialize/jsonwriter.h"
+ #include "serialize/serialize_torrent.h"
+ 
+ // Tracker keys
+@@ -430,7 +432,10 @@ void TorrentsController::infoAction()
+     if ((limit > 0) || (offset > 0))
+         torrentList = torrentList.mid(offset, limit);
+ 
+-    setResult(QJsonArray::fromVariantList(torrentList));
++    QByteArray json;
++    json.reserve(torrentList.size() * 2048);
++    JsonWriter::appendList(json, torrentList);
++    setResult(json, Http::CONTENT_TYPE_JSON);
+ }
+ 
+ // Returns the properties for a torrent in JSON format.
+-- 
+2.47.3
+

@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anonymous <anonymous@localhost>
+Date: Fri, 09 Oct 2026 04:05:35 +0000
+Subject: [PATCH 21/22] Free the torrent extension's initial data once it is
+ used
+
+NativeTorrentExtension fills an ExtensionData (the torrent's full status
+with its piece bitfields, its trackers and URL seeds) for TorrentImpl's
+constructor and reload(), and owns it until the torrent is removed. Nothing
+reads it after that, but every torrent kept it: about 10-15 MB with ~9,000
+torrents. Clear it once it has been read.
+---
+ src/base/bittorrent/torrentimpl.cpp | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/base/bittorrent/torrentimpl.cpp b/src/base/bittorrent/torrentimpl.cpp
+index b82533a..6ed16ba 100644
+--- a/src/base/bittorrent/torrentimpl.cpp
++++ b/src/base/bittorrent/torrentimpl.cpp
+@@ -367,7 +367,7 @@ TorrentImpl::TorrentImpl(SessionImpl *session, lt::session *nativeSession
+ 
+     setStopCondition(params.stopCondition);
+ 
+-    const auto *extensionData = static_cast<ExtensionData *>(m_ltAddTorrentParams.userdata);
++    auto *extensionData = static_cast<ExtensionData *>(m_ltAddTorrentParams.userdata);
+     m_trackerEntryStatuses.reserve(static_cast<decltype(m_trackerEntryStatuses)::size_type>(extensionData->trackers.size()));
+     for (const lt::announce_entry &announceEntry : extensionData->trackers)
+         m_trackerEntryStatuses.append({QString::fromStdString(announceEntry.url), announceEntry.tier});
+@@ -375,6 +375,9 @@ TorrentImpl::TorrentImpl(SessionImpl *session, lt::session *nativeSession
+     for (const std::string &urlSeed : extensionData->urlSeeds)
+         m_urlSeeds.append(QString::fromStdString(urlSeed));
+     m_nativeStatus = extensionData->status;
++    // The extension filled it for this constructor only, but owns it as long as the torrent exists (it no
++    // longer touches it until it deletes it): free the status, trackers and URL seeds it holds.
++    *extensionData = {};
+ 
+     m_addedTime = QDateTime::fromSecsSinceEpoch(m_nativeStatus.added_time);
+     if (m_nativeStatus.completed_time > 0)
+@@ -1929,6 +1932,7 @@ void TorrentImpl::reload()
+         m_nativeHandle = m_nativeSession->add_torrent(p);
+ 
+         m_nativeStatus = extensionData->status;
++        *extensionData = {};  // see the constructor
+         trimNativeStatus();
+ 
+         if (queuePos >= lt::queue_position_t {})
+-- 
+2.47.3
+

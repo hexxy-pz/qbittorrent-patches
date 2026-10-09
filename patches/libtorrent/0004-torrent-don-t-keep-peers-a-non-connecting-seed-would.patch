@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anonymous <anonymous@localhost>
+Date: Fri, 09 Oct 2026 04:05:14 +0000
+Subject: [PATCH 4/4] torrent: don't keep peers a non-connecting seed would
+ never use
+
+With seeding_outgoing_connections off, a seeding (or finished) torrent never
+connects out, so the peers trackers hand out sit in its peer list unused (a
+private torrent has no DHT or PEX that would pass them on). With thousands
+of seeding torrents that is tens of thousands of entries. Tracker peers are
+no longer added to such torrents, and resume data peers are not added to a
+torrent that resumes as a seed; banned peers from resume data are kept, and
+peers that connect to us are added as before. Tracker replies still report
+how many peers they returned.
+
+When the setting is switched on, or a seed starts downloading again, the
+next announce fills the list.
+---
+ src/torrent.cpp | 32 ++++++++++++++++++++++++++++----
+ 1 file changed, 28 insertions(+), 4 deletions(-)
+
+diff --git a/src/torrent.cpp b/src/torrent.cpp
+index 9c617fa84..c4452ff6b 100644
+--- a/src/torrent.cpp
++++ b/src/torrent.cpp
+@@ -618,9 +618,17 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
+ 			set_limit_impl(p.upload_limit, peer_connection::upload_channel, false);
+ 			set_limit_impl(p.download_limit, peer_connection::download_channel, false);
+ 
+-			for (auto const& peer : p.peers)
++			// a torrent that resumes as a seed while seeds make no outgoing
++			// connections would never connect to these
++			bool const resumes_as_seed = (p.flags & torrent_flags::seed_mode)
++				|| (valid_metadata() && p.have_pieces.size() == m_torrent_file->num_pieces()
++					&& p.have_pieces.all_set());
++			if (settings().get_bool(settings_pack::seeding_outgoing_connections) || !resumes_as_seed)
+ 			{
+-				add_peer(peer, peer_info::resume_data);
++				for (auto const& peer : p.peers)
++				{
++					add_peer(peer, peer_info::resume_data);
++				}
+ 			}
+ 
+ 			if (!p.peers.empty())
+@@ -2183,9 +2191,13 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
+ 		{
+ 			// --- PEERS ---
+ 
+-			for (auto const& p : m_add_torrent_params->peers)
++			if (settings().get_bool(settings_pack::seeding_outgoing_connections)
++				|| !(is_seed() || is_finished()))
+ 			{
+-				add_peer(p , peer_info::resume_data);
++				for (auto const& p : m_add_torrent_params->peers)
++				{
++					add_peer(p , peer_info::resume_data);
++				}
+ 			}
+ 
+ #ifndef TORRENT_DISABLE_LOGGING
+@@ -11499,6 +11511,18 @@ namespace {
+ 		}
+ #endif
+ 
++		// a seed that makes no outgoing connections never uses the peers trackers
++		// hand out (a private torrent has no DHT or PEX that would pass them on
++		// either): don't keep them. Peers connecting to us are added when they
++		// connect. (Resume data peers are skipped where they are added, banned
++		// ones are kept.)
++		if ((source & peer_info::tracker)
++			&& !settings().get_bool(settings_pack::seeding_outgoing_connections)
++			&& (m_state == torrent_status::seeding || m_state == torrent_status::finished))
++		{
++			return nullptr;
++		}
++
+ 		if (!torrent_file().info_hashes().has_v1())
+ 			flags |= pex_lt_v2;
+ 
+-- 
+2.47.3
+

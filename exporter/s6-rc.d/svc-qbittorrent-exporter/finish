@@ -1,0 +1,8 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+# Drop the metrics file when the exporter stops, so node-exporter does not keep serving the last values.
+
+if [[ -n ${QBT_EXPORTER_FILE} ]]; then
+    rm -f "${QBT_EXPORTER_FILE}"
+fi
+exit 0

@@ -1,0 +1,85 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anonymous <anonymous@localhost>
+Date: Fri, 02 Oct 2026 04:46:22 +0000
+Subject: [PATCH] Add setting to override libtorrent settings
+
+Session\LibtorrentSettingsOverride holds "name=value" pairs with
+libtorrent's setting names, applied after qBittorrent's own settings,
+for settings qBittorrent does not expose.
+---
+ src/base/bittorrent/sessionimpl.cpp | 39 +++++++++++++++++++++++++++++
+ src/base/bittorrent/sessionimpl.h   |  1 +
+ 2 files changed, 40 insertions(+)
+
+diff --git a/src/base/bittorrent/sessionimpl.cpp b/src/base/bittorrent/sessionimpl.cpp
+index 25f29ed31..67dea89f7 100644
+--- a/src/base/bittorrent/sessionimpl.cpp
++++ b/src/base/bittorrent/sessionimpl.cpp
+@@ -466,6 +466,7 @@ SessionImpl::SessionImpl(QObject *parent)
+     , m_isSeedingOutgoingConnectionsEnabled(BITTORRENT_SESSION_KEY(u"SeedingOutgoingConnections"_s), true)
+     , m_isAddTrackersEnabled(BITTORRENT_SESSION_KEY(u"AddTrackersEnabled"_s), false)
+     , m_additionalTrackers(BITTORRENT_SESSION_KEY(u"AdditionalTrackers"_s))
++    , m_libtorrentSettingsOverride(BITTORRENT_SESSION_KEY(u"LibtorrentSettingsOverride"_s))
+     , m_isAddTrackersFromURLEnabled(BITTORRENT_SESSION_KEY(u"AddTrackersFromURLEnabled"_s), false)
+     , m_additionalTrackersURL(BITTORRENT_SESSION_KEY(u"AdditionalTrackersURL"_s))
+     , m_globalMaxRatio(BITTORRENT_SESSION_KEY(u"GlobalMaxRatio"_s), -1, [](qreal r) { return r < 0 ? -1. : r; })
+@@ -2101,6 +2102,44 @@ lt::settings_pack SessionImpl::loadLTSettings() const
+         break;
+     }
+ 
++    // Session\LibtorrentSettingsOverride: "name=value" pairs (separated by "," or ";") with
++    // libtorrent's own setting names, applied last, for settings qBittorrent does not expose
++    const QString overrides = m_libtorrentSettingsOverride;
++    for (const QString &entry : overrides.split(QRegularExpression(u"[,;\\n]"_s), Qt::SkipEmptyParts))
++    {
++        const qsizetype eq = entry.indexOf(u'=');
++        if (eq <= 0)
++            continue;
++        const std::string name = entry.left(eq).trimmed().toStdString();
++        const QString value = entry.mid(eq + 1).trimmed();
++        const int index = lt::setting_by_name(name);
++        if (index < 0)
++        {
++            LogMsg(tr("Unknown libtorrent setting in LibtorrentSettingsOverride: \"%1\"").arg(QString::fromStdString(name)), Log::WARNING);
++            continue;
++        }
++        switch (index & lt::settings_pack::type_mask)
++        {
++        case lt::settings_pack::string_type_base:
++            settingsPack.set_str(index, value.toStdString());
++            break;
++        case lt::settings_pack::int_type_base:
++            {
++                bool ok = false;
++                const int number = value.toInt(&ok);
++                if (ok)
++                    settingsPack.set_int(index, number);
++                else
++                    LogMsg(tr("Invalid value for libtorrent setting \"%1\": \"%2\"").arg(QString::fromStdString(name), value), Log::WARNING);
++            }
++            break;
++        case lt::settings_pack::bool_type_base:
++            settingsPack.set_bool(index, ((value == u"1") || (value.compare(u"true", Qt::CaseInsensitive) == 0)
++                || (value.compare(u"on", Qt::CaseInsensitive) == 0) || (value.compare(u"yes", Qt::CaseInsensitive) == 0)));
++            break;
++        }
++    }
++
+     return settingsPack;
+ }
+ 
+diff --git a/src/base/bittorrent/sessionimpl.h b/src/base/bittorrent/sessionimpl.h
+index 7c202a89f..9ef980774 100644
+--- a/src/base/bittorrent/sessionimpl.h
++++ b/src/base/bittorrent/sessionimpl.h
+@@ -694,6 +694,7 @@ namespace BitTorrent
+         CachedSettingValue<bool> m_isSeedingOutgoingConnectionsEnabled;
+         CachedSettingValue<bool> m_isAddTrackersEnabled;
+         CachedSettingValue<QString> m_additionalTrackers;
++        CachedSettingValue<QString> m_libtorrentSettingsOverride;
+         CachedSettingValue<bool> m_isAddTrackersFromURLEnabled;
+         CachedSettingValue<QString> m_additionalTrackersURL;
+         CachedSettingValue<qreal> m_globalMaxRatio;
+-- 
+2.47.3
+

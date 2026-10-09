@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anonymous <anonymous@localhost>
+Date: Thu, 01 Oct 2026 22:22:13 +0000
+Subject: [PATCH 1/3] Compile constant path regexes once
+
+Path::isValid(), Utils::Fs::toValidPath() and Utils::Fs::toValidFileName()
+constructed a QRegularExpression on every call, so every call paid a PCRE2
+compile and JIT compile. toValidPath() runs for every Auto TMM torrent whose
+category has an implicit download path each time the torrent is serialized
+(sync/maindata, torrents/info).
+---
+ src/base/path.cpp     | 8 ++++----
+ src/base/utils/fs.cpp | 4 ++--
+ 2 files changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/src/base/path.cpp b/src/base/path.cpp
+index 14950d4..fa5bf8d 100644
+--- a/src/base/path.cpp
++++ b/src/base/path.cpp
+@@ -64,7 +64,7 @@ namespace
+ #ifdef Q_OS_WIN
+     bool hasDriveLetter(const QStringView path)
+     {
+-        const QRegularExpression driveLetterRegex {u"^[A-Za-z]:/"_s};
++        static const QRegularExpression driveLetterRegex {u"^[A-Za-z]:/"_s};
+         return driveLetterRegex.match(path).hasMatch();
+     }
+ #endif
+@@ -97,12 +97,12 @@ bool Path::isValid() const
+         view = view.mid(3);
+ 
+     // \\37 is using base-8 number system
+-    const QRegularExpression regex {u"[\\0-\\37:?\"*<>|]"_s};
++    static const QRegularExpression regex {u"[\\0-\\37:?\"*<>|]"_s};
+     return !regex.match(view).hasMatch();
+ #elif defined(Q_OS_MACOS)
+-    const QRegularExpression regex {u"[\\0:]"_s};
++    static const QRegularExpression regex {u"[\\0:]"_s};
+ #else
+-    const QRegularExpression regex {u"\\0"_s};
++    static const QRegularExpression regex {u"\\0"_s};
+ #endif
+     return !m_pathStr.contains(regex);
+ }
+diff --git a/src/base/utils/fs.cpp b/src/base/utils/fs.cpp
+index d0ac3bb..e6a4821 100644
+--- a/src/base/utils/fs.cpp
++++ b/src/base/utils/fs.cpp
+@@ -189,7 +189,7 @@ bool Utils::Fs::sameFiles(const Path &path1, const Path &path2)
+ 
+ QString Utils::Fs::toValidFileName(const QString &name, const QString &pad)
+ {
+-    const QRegularExpression regex {u"[\\\\/:?\"*<>|]+"_s};
++    static const QRegularExpression regex {u"[\\\\/:?\"*<>|]+"_s};
+ 
+     QString validName = name.trimmed();
+     validName.replace(regex, pad);
+@@ -199,7 +199,7 @@ QString Utils::Fs::toValidFileName(const QString &name, const QString &pad)
+ 
+ Path Utils::Fs::toValidPath(const QString &name, const QString &pad)
+ {
+-    const QRegularExpression regex {u"[:?\"*<>|]+"_s};
++    static const QRegularExpression regex {u"[:?\"*<>|]+"_s};
+ 
+     QString validPathStr = name;
+     validPathStr.replace(regex, pad);
+-- 
+2.47.3
+

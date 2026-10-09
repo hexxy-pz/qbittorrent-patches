@@ -1,0 +1,39 @@
+From bf5b738759e436dffab3a6f58926a0a4c20e7c84 Mon Sep 17 00:00:00 2001
+From: Tom Piccirello <8296030+Piccirello@users.noreply.github.com>
+Date: Thu, 26 Feb 2026 05:21:29 -0800
+Subject: [PATCH 09/12] WebUI: Fix column reordering with virtual rows
+
+When virtual rows are enabled, column content is incorrectly duplicated when columns are reordered.
+
+PR #23860.
+
+(cherry picked from commit 20c8f5bc0f4f838495832418b1fac95674302f21)
+
+Backport to 5.1.4: 5.1.4's global LocalPreferences.
+---
+ src/webui/www/private/scripts/dynamicTable.js | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/webui/www/private/scripts/dynamicTable.js b/src/webui/www/private/scripts/dynamicTable.js
+index f95a9926d..98049ce1d 100644
+--- a/src/webui/www/private/scripts/dynamicTable.js
++++ b/src/webui/www/private/scripts/dynamicTable.js
+@@ -316,8 +316,15 @@ window.qBittorrent.DynamicTable ??= (() => {
+                         ++pos;
+                     val.splice(pos, 0, el.columnName);
+                     LocalPreferences.set(`columns_order_${this.dynamicTableDivId}`, val.join(","));
++                    const oldIndexByName = new Map(this.columns.map((col, i) => [col.name, i]));
+                     this.loadColumnsOrder();
+                     this.updateTableHeaders();
++                    for (const tr of this.cachedElements) {
++                        if (!tr)
++                            continue;
++                        const tds = [...tr.children];
++                        tr.replaceChildren(...this.columns.map(col => tds[oldIndexByName.get(col.name)]));
++                    }
+                     this.tableBody.replaceChildren();
+                     this.updateTable(true);
+                     this.reselectRows(this.selectedRowsIds());
+-- 
+2.47.3
+

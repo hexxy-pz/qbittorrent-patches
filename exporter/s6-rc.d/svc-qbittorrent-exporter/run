@@ -1,0 +1,14 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+# Torrent statistics for node-exporter's textfile collector (exporter/qbittorrent-exporter.py).
+# Off unless QBT_EXPORTER_FILE is set, so the image stays a drop-in linuxserver replacement.
+
+if [[ -z ${QBT_EXPORTER_FILE} ]]; then
+    exec sleep infinity
+fi
+
+if [[ -z ${LSIO_NON_ROOT_USER} ]]; then
+    exec s6-setuidgid abc python3 /usr/local/bin/qbittorrent-exporter
+else
+    exec python3 /usr/local/bin/qbittorrent-exporter
+fi

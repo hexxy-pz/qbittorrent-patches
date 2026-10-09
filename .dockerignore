@@ -1,0 +1,6 @@
+.git
+.forgejo
+ci
+README.md
+renovate.json
+.gitattributes

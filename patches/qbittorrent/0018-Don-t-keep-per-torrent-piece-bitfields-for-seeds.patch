@@ -1,0 +1,239 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anonymous <anonymous@localhost>
+Date: Fri, 09 Oct 2026 01:14:49 +0000
+Subject: [PATCH 18/20] Don't keep per-torrent piece bitfields for seeds
+
+Each torrent held its piece state up to four times: the cached
+torrent_status (pieces and verified_pieces), m_pieces and the have
+bitfield of the cached resume data. For a seed they are all ones (or, for
+verified_pieces, never read), so keep flags instead and expand them where a
+full bitfield is still needed: pieces(), reload() and resume data
+preparation. Status updates no longer request verified_pieces.
+---
+ src/base/bittorrent/sessionimpl.cpp | 11 ++++-
+ src/base/bittorrent/torrentimpl.cpp | 64 +++++++++++++++++++++++++++--
+ src/base/bittorrent/torrentimpl.h   |  9 ++++
+ 3 files changed, 78 insertions(+), 6 deletions(-)
+
+diff --git a/src/base/bittorrent/sessionimpl.cpp b/src/base/bittorrent/sessionimpl.cpp
+index 401f4e7..dede586 100644
+--- a/src/base/bittorrent/sessionimpl.cpp
++++ b/src/base/bittorrent/sessionimpl.cpp
+@@ -113,6 +113,13 @@
+ using namespace std::chrono_literals;
+ using namespace BitTorrent;
+ 
++namespace
++{
++    // Everything but verified_pieces (only filled in seed mode), which nothing reads: no point copying a
++    // bitfield per updated torrent on every refresh.
++    const lt::status_flags_t TORRENT_STATUS_FLAGS = lt::status_flags_t::all() & ~lt::torrent_handle::query_verified_pieces;
++}
++
+ const Path CATEGORIES_FILE_NAME {u"categories.json"_s};
+ const int MAX_PROCESSING_RESUMEDATA_COUNT = 50;
+ 
+@@ -1368,7 +1375,7 @@ void SessionImpl::prepareStartup()
+ 
+         if (!m_refreshEnqueued)
+         {
+-            m_nativeSession->post_torrent_updates();
++            m_nativeSession->post_torrent_updates(TORRENT_STATUS_FLAGS);
+             m_refreshEnqueued = true;
+         }
+ 
+@@ -5816,7 +5823,7 @@ void SessionImpl::enqueueRefresh()
+ 
+     QTimer::singleShot(refreshInterval(), Qt::CoarseTimer, this, [this]
+     {
+-        m_nativeSession->post_torrent_updates();
++        m_nativeSession->post_torrent_updates(TORRENT_STATUS_FLAGS);
+         m_nativeSession->post_session_stats();
+ 
+         if (m_torrentsQueueChanged)
+diff --git a/src/base/bittorrent/torrentimpl.cpp b/src/base/bittorrent/torrentimpl.cpp
+index 8cebddf..c39999b 100644
+--- a/src/base/bittorrent/torrentimpl.cpp
++++ b/src/base/bittorrent/torrentimpl.cpp
+@@ -383,6 +383,8 @@ TorrentImpl::TorrentImpl(SessionImpl *session, lt::session *nativeSession
+ 
+     if (hasMetadata())
+         updateProgress();
++    trimNativeStatus();
++    compactResumeProgress();
+ 
+     updateState();
+ 
+@@ -1488,6 +1490,8 @@ QList<PeerInfo> TorrentImpl::peers() const
+ 
+ QBitArray TorrentImpl::pieces() const
+ {
++    if (m_hasAllPieces)
++        return QBitArray(piecesCount(), true);
+     return m_pieces;
+ }
+ 
+@@ -1667,9 +1671,10 @@ void TorrentImpl::forceRecheck()
+     m_ltAddTorrentParams.have_pieces.clear();
+     m_ltAddTorrentParams.verified_pieces.clear();
+     m_ltAddTorrentParams.unfinished_pieces.clear();
++    m_resumeHasAllPieces = false;
+     m_completedFiles.fill(false);
+     m_filesProgress.fill(0);
+-    m_pieces.fill(false);
++    resetPieces();
+     m_unchecked = false;
+ 
+     if (m_hasMissingFiles)
+@@ -1886,7 +1891,7 @@ void TorrentImpl::reload()
+     {
+         m_completedFiles.fill(false);
+         m_filesProgress.fill(0);
+-        m_pieces.fill(false);
++        resetPieces();
+         m_nativeStatus.pieces.clear_all();
+         m_nativeStatus.num_pieces = 0;
+ 
+@@ -1894,7 +1899,9 @@ void TorrentImpl::reload()
+ 
+         m_nativeSession->remove_torrent(m_nativeHandle, lt::session::delete_partfile);
+ 
++        expandResumeProgress();
+         lt::add_torrent_params p = m_ltAddTorrentParams;
++        compactResumeProgress();
+         p.flags |= lt::torrent_flags::update_subscribe
+                 | lt::torrent_flags::override_trackers
+                 | lt::torrent_flags::override_web_seeds;
+@@ -1921,6 +1928,7 @@ void TorrentImpl::reload()
+         m_nativeHandle = m_nativeSession->add_torrent(p);
+ 
+         m_nativeStatus = extensionData->status;
++        trimNativeStatus();
+ 
+         if (queuePos >= lt::queue_position_t {})
+             m_nativeHandle.queue_position_set(queuePos);
+@@ -2167,6 +2175,7 @@ void TorrentImpl::handleSaveResumeDataAlert(const lt::save_resume_data_alert *p)
+ 
+         const auto isSeedMode = static_cast<bool>(m_ltAddTorrentParams.flags & lt::torrent_flags::seed_mode);
+         m_ltAddTorrentParams = p->params;
++        m_resumeHasAllPieces = false;
+         if (isSeedMode)
+             m_ltAddTorrentParams.flags |= lt::torrent_flags::seed_mode;
+ 
+@@ -2215,6 +2224,8 @@ void TorrentImpl::handleSaveResumeDataAlert(const lt::save_resume_data_alert *p)
+ 
+ void TorrentImpl::prepareResumeData(const lt::add_torrent_params &params)
+ {
++    expandResumeProgress();
++
+     {
+         decltype(params.have_pieces) havePieces;
+         decltype(params.unfinished_pieces) unfinishedPieces;
+@@ -2277,6 +2288,8 @@ void TorrentImpl::prepareResumeData(const lt::add_torrent_params &params)
+     };
+ 
+     m_session->handleTorrentResumeDataReady(this, resumeData);
++
++    compactResumeProgress();
+ }
+ 
+ void TorrentImpl::handleSaveResumeDataFailedAlert(const lt::save_resume_data_failed_alert *p)
+@@ -2652,6 +2665,7 @@ void TorrentImpl::updateStatus(const lt::torrent_status &nativeStatus)
+ 
+     if (m_nativeStatus.num_pieces != oldStatus.num_pieces)
+         updateProgress();
++    trimNativeStatus();
+ 
+     if (m_nativeStatus.completed_time != oldStatus.completed_time)
+         m_completedTime = (m_nativeStatus.completed_time > 0) ? QDateTime::fromSecsSinceEpoch(m_nativeStatus.completed_time) : QDateTime();
+@@ -2688,8 +2702,13 @@ void TorrentImpl::updateProgress()
+     if (m_filesProgress.isEmpty()) [[unlikely]]
+         m_filesProgress.resize(filesCount());
+ 
+-    const QBitArray oldPieces = std::exchange(m_pieces, LT::toQBitArray(m_nativeStatus.pieces));
+-    const QBitArray newPieces = m_pieces ^ oldPieces;
++    const int piecesCount = m_torrentInfo.piecesCount();
++    const bool hasAllPieces = (m_nativeStatus.num_pieces == piecesCount);
++    const QBitArray oldPieces = std::exchange(m_hasAllPieces, hasAllPieces)
++            ? QBitArray(piecesCount, true) : std::exchange(m_pieces, {});
++    if (!hasAllPieces)
++        m_pieces = LT::toQBitArray(m_nativeStatus.pieces);
++    const QBitArray newPieces = (hasAllPieces ? QBitArray(piecesCount, true) : m_pieces) ^ oldPieces;
+ 
+     const int64_t pieceSize = m_torrentInfo.pieceLength();
+     for (qsizetype index = 0; index < newPieces.size(); ++index)
+@@ -2716,6 +2735,43 @@ void TorrentImpl::updateProgress()
+     }
+ }
+ 
++// The cached status needs its piece bitfield only for updateProgress(), which runs when num_pieces changes
++// (libtorrent then sends a fresh bitfield), and verified_pieces is never read: drop them for seeds instead of
++// holding copies for every torrent.
++void TorrentImpl::trimNativeStatus()
++{
++    m_nativeStatus.verified_pieces.clear();
++    if (hasMetadata() && (m_nativeStatus.num_pieces == m_torrentInfo.piecesCount()))
++        m_nativeStatus.pieces.clear();
++}
++
++void TorrentImpl::resetPieces()
++{
++    if (std::exchange(m_hasAllPieces, false))
++        m_pieces = QBitArray(m_torrentInfo.piecesCount(), false);
++    else
++        m_pieces.fill(false);
++}
++
++// Between resume data saves, a seed's "have" bitfield is only kept to re-add the torrent (reload()) or to
++// preserve progress, so it is stored as a flag and expanded when it is needed.
++void TorrentImpl::compactResumeProgress()
++{
++    lt::typed_bitfield<lt::piece_index_t> &havePieces = m_ltAddTorrentParams.have_pieces;
++    if (hasMetadata() && !havePieces.empty() && (havePieces.size() == m_torrentInfo.piecesCount())
++            && havePieces.all_set())
++    {
++        havePieces.clear();
++        m_resumeHasAllPieces = true;
++    }
++}
++
++void TorrentImpl::expandResumeProgress()
++{
++    if (std::exchange(m_resumeHasAllPieces, false))
++        m_ltAddTorrentParams.have_pieces.resize(m_torrentInfo.piecesCount(), true);
++}
++
+ void TorrentImpl::setRatioLimit(qreal limit)
+ {
+     if (limit < USE_GLOBAL_RATIO)
+diff --git a/src/base/bittorrent/torrentimpl.h b/src/base/bittorrent/torrentimpl.h
+index 5c54b2d..b296ad5 100644
+--- a/src/base/bittorrent/torrentimpl.h
++++ b/src/base/bittorrent/torrentimpl.h
+@@ -289,6 +289,10 @@ namespace BitTorrent
+ 
+         void updateStatus(const lt::torrent_status &nativeStatus);
+         void updateProgress();
++        void trimNativeStatus();
++        void resetPieces();
++        void compactResumeProgress();
++        void expandResumeProgress();
+         void updateState();
+ 
+         void handleFastResumeRejectedAlert(const lt::fastresume_rejected_alert *p);
+@@ -392,7 +396,12 @@ namespace BitTorrent
+         int m_downloadLimit = 0;
+         int m_uploadLimit = 0;
+ 
++        // A seed's piece bitfields are all ones: they are kept as these flags instead of one bitfield per
++        // torrent (m_pieces is empty while m_hasAllPieces, m_ltAddTorrentParams.have_pieces while
++        // m_resumeHasAllPieces).
+         QBitArray m_pieces;
++        bool m_hasAllPieces = false;
++        bool m_resumeHasAllPieces = false;
+         QList<std::int64_t> m_filesProgress;
+ 
+         bool m_deferredRequestResumeDataInvoked = false;
+-- 
+2.47.3
+

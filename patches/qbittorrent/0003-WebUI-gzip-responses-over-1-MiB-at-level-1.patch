@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anonymous <anonymous@localhost>
+Date: Thu, 01 Oct 2026 22:24:37 +0000
+Subject: [PATCH 3/3] WebUI: gzip responses over 1 MiB at level 1
+
+---
+ src/base/http/responsegenerator.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/base/http/responsegenerator.cpp b/src/base/http/responsegenerator.cpp
+index b34b973..7d81bd0 100644
+--- a/src/base/http/responsegenerator.cpp
++++ b/src/base/http/responsegenerator.cpp
+@@ -97,8 +97,11 @@ void Http::compressContent(Response &response)
+         return;
+ 
+     // try compressing
++    // large responses (sync/maindata, torrents/info with thousands of torrents) use the fastest level:
++    // on such JSON level 6 takes about twice as long as level 1 for output about 20% smaller
++    const int level = (contentSize > (1024 * 1024)) ? 1 : 6;
+     bool ok = false;
+-    const QByteArray compressedData = Utils::Gzip::compress(response.content, 6, &ok);
++    const QByteArray compressedData = Utils::Gzip::compress(response.content, level, &ok);
+     if (!ok)
+         return;
+ 
+-- 
+2.47.3
+

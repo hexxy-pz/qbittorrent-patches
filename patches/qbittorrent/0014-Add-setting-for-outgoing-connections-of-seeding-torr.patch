@@ -1,0 +1,160 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anonymous <anonymous@localhost>
+Date: Fri, 02 Oct 2026 03:43:26 +0000
+Subject: [PATCH] Add setting for outgoing connections of seeding torrents
+
+Exposes libtorrent's seeding_outgoing_connections as
+BitTorrent\Session\SeedingOutgoingConnections (default true, libtorrent's
+default) and the WebAPI preference seeding_outgoing_connections, with a
+WebUI Advanced option.
+
+With thousands of seeding torrents on private trackers, almost every peer
+a tracker returns is another seed: libtorrent connects, both sides see
+there is nothing to exchange, and the connection is closed as redundant.
+That keeps the connection rate at the connection_speed limit for hours
+after every start. With the setting off, seeding torrents only accept
+incoming connections; leechers still connect to them.
+---
+ src/base/bittorrent/session.h                |  2 ++
+ src/base/bittorrent/sessionimpl.cpp          | 16 ++++++++++++++++
+ src/base/bittorrent/sessionimpl.h            |  3 +++
+ src/webui/api/appcontroller.cpp              |  5 +++++
+ src/webui/www/private/views/preferences.html | 10 ++++++++++
+ 5 files changed, 36 insertions(+)
+
+diff --git a/src/base/bittorrent/session.h b/src/base/bittorrent/session.h
+index d35b9839e..bd9841774 100644
+--- a/src/base/bittorrent/session.h
++++ b/src/base/bittorrent/session.h
+@@ -432,6 +432,8 @@ namespace BitTorrent
+         virtual void setSSRFMitigationEnabled(bool enabled) = 0;
+         virtual bool blockPeersOnPrivilegedPorts() const = 0;
+         virtual void setBlockPeersOnPrivilegedPorts(bool enabled) = 0;
++        virtual bool isSeedingOutgoingConnectionsEnabled() const = 0;
++        virtual void setSeedingOutgoingConnectionsEnabled(bool enabled) = 0;
+         virtual bool isTrackerFilteringEnabled() const = 0;
+         virtual void setTrackerFilteringEnabled(bool enabled) = 0;
+         virtual bool isExcludedFileNamesEnabled() const = 0;
+diff --git a/src/base/bittorrent/sessionimpl.cpp b/src/base/bittorrent/sessionimpl.cpp
+index b18c4ee8b..25f29ed31 100644
+--- a/src/base/bittorrent/sessionimpl.cpp
++++ b/src/base/bittorrent/sessionimpl.cpp
+@@ -463,6 +463,7 @@ SessionImpl::SessionImpl(QObject *parent)
+     , m_validateHTTPSTrackerCertificate(BITTORRENT_SESSION_KEY(u"ValidateHTTPSTrackerCertificate"_s), true)
+     , m_SSRFMitigationEnabled(BITTORRENT_SESSION_KEY(u"SSRFMitigation"_s), true)
+     , m_blockPeersOnPrivilegedPorts(BITTORRENT_SESSION_KEY(u"BlockPeersOnPrivilegedPorts"_s), false)
++    , m_isSeedingOutgoingConnectionsEnabled(BITTORRENT_SESSION_KEY(u"SeedingOutgoingConnections"_s), true)
+     , m_isAddTrackersEnabled(BITTORRENT_SESSION_KEY(u"AddTrackersEnabled"_s), false)
+     , m_additionalTrackers(BITTORRENT_SESSION_KEY(u"AdditionalTrackers"_s))
+     , m_isAddTrackersFromURLEnabled(BITTORRENT_SESSION_KEY(u"AddTrackersFromURLEnabled"_s), false)
+@@ -2067,6 +2068,8 @@ lt::settings_pack SessionImpl::loadLTSettings() const
+ 
+     settingsPack.set_bool(lt::settings_pack::no_connect_privileged_ports, blockPeersOnPrivilegedPorts());
+ 
++    settingsPack.set_bool(lt::settings_pack::seeding_outgoing_connections, isSeedingOutgoingConnectionsEnabled());
++
+     settingsPack.set_bool(lt::settings_pack::apply_ip_filter_to_trackers, isTrackerFilteringEnabled());
+ 
+     settingsPack.set_str(lt::settings_pack::dht_bootstrap_nodes, getDHTBootstrapNodes().toStdString());
+@@ -5107,6 +5110,19 @@ void SessionImpl::setBlockPeersOnPrivilegedPorts(const bool enabled)
+     configureDeferred();
+ }
+ 
++bool SessionImpl::isSeedingOutgoingConnectionsEnabled() const
++{
++    return m_isSeedingOutgoingConnectionsEnabled;
++}
++
++void SessionImpl::setSeedingOutgoingConnectionsEnabled(const bool enabled)
++{
++    if (enabled == m_isSeedingOutgoingConnectionsEnabled) return;
++
++    m_isSeedingOutgoingConnectionsEnabled = enabled;
++    configureDeferred();
++}
++
+ bool SessionImpl::isTrackerFilteringEnabled() const
+ {
+     return m_isTrackerFilteringEnabled;
+diff --git a/src/base/bittorrent/sessionimpl.h b/src/base/bittorrent/sessionimpl.h
+index 322eab125..7c202a89f 100644
+--- a/src/base/bittorrent/sessionimpl.h
++++ b/src/base/bittorrent/sessionimpl.h
+@@ -400,6 +400,8 @@ namespace BitTorrent
+         void setSSRFMitigationEnabled(bool enabled) override;
+         bool blockPeersOnPrivilegedPorts() const override;
+         void setBlockPeersOnPrivilegedPorts(bool enabled) override;
++        bool isSeedingOutgoingConnectionsEnabled() const override;
++        void setSeedingOutgoingConnectionsEnabled(bool enabled) override;
+         bool isTrackerFilteringEnabled() const override;
+         void setTrackerFilteringEnabled(bool enabled) override;
+         bool isExcludedFileNamesEnabled() const override;
+@@ -689,6 +691,7 @@ namespace BitTorrent
+         CachedSettingValue<bool> m_validateHTTPSTrackerCertificate;
+         CachedSettingValue<bool> m_SSRFMitigationEnabled;
+         CachedSettingValue<bool> m_blockPeersOnPrivilegedPorts;
++        CachedSettingValue<bool> m_isSeedingOutgoingConnectionsEnabled;
+         CachedSettingValue<bool> m_isAddTrackersEnabled;
+         CachedSettingValue<QString> m_additionalTrackers;
+         CachedSettingValue<bool> m_isAddTrackersFromURLEnabled;
+diff --git a/src/webui/api/appcontroller.cpp b/src/webui/api/appcontroller.cpp
+index 6cc014d46..89f78689f 100644
+--- a/src/webui/api/appcontroller.cpp
++++ b/src/webui/api/appcontroller.cpp
+@@ -465,6 +465,8 @@ void AppController::preferencesAction()
+     data[u"ssrf_mitigation"_s] = session->isSSRFMitigationEnabled();
+     // Disallow connection to peers on privileged ports
+     data[u"block_peers_on_privileged_ports"_s] = session->blockPeersOnPrivilegedPorts();
++    // Seeding torrents make outgoing connections
++    data[u"seeding_outgoing_connections"_s] = session->isSeedingOutgoingConnectionsEnabled();
+     // Choking algorithm
+     data[u"upload_slots_behavior"_s] = static_cast<int>(session->chokingAlgorithm());
+     // Seed choking algorithm
+@@ -1129,6 +1131,9 @@ void AppController::setPreferencesAction()
+     // Disallow connection to peers on privileged ports
+     if (hasKey(u"block_peers_on_privileged_ports"_s))
+         session->setBlockPeersOnPrivilegedPorts(it.value().toBool());
++    // Seeding torrents make outgoing connections
++    if (hasKey(u"seeding_outgoing_connections"_s))
++        session->setSeedingOutgoingConnectionsEnabled(it.value().toBool());
+     // Choking algorithm
+     if (hasKey(u"upload_slots_behavior"_s))
+         session->setChokingAlgorithm(static_cast<BitTorrent::ChokingAlgorithm>(it.value().toInt()));
+diff --git a/src/webui/www/private/views/preferences.html b/src/webui/www/private/views/preferences.html
+index 5dea2670e..cb93257b3 100644
+--- a/src/webui/www/private/views/preferences.html
++++ b/src/webui/www/private/views/preferences.html
+@@ -1578,6 +1578,14 @@ Use ';' to split multiple entries. Can use wildcard '*'.)QBT_TR[CONTEXT=OptionsD
+                         <input type="checkbox" id="blockPeersOnPrivilegedPorts">
+                     </td>
+                 </tr>
++                <tr>
++                    <td>
++                        <label for="seedingOutgoingConnections">QBT_TR(Seeding torrents make outgoing connections:)QBT_TR[CONTEXT=OptionsDialog]&nbsp;<a href="https://libtorrent.org/single-page-ref.html#seeding_outgoing_connections" target="_blank">(?)</a></label>
++                    </td>
++                    <td>
++                        <input type="checkbox" id="seedingOutgoingConnections">
++                    </td>
++                </tr>
+                 <tr>
+                     <td>
+                         <label for="uploadSlotsBehavior">QBT_TR(Upload slots behavior:)QBT_TR[CONTEXT=OptionsDialog]&nbsp;<a href="https://www.libtorrent.org/reference-Settings.html#choking_algorithm" target="_blank">(?)</a></label>
+@@ -2601,6 +2609,7 @@ Use ';' to split multiple entries. Can use wildcard '*'.)QBT_TR[CONTEXT=OptionsD
+                     $("validateHTTPSTrackerCertificate").checked = pref.validate_https_tracker_certificate;
+                     $("mitigateSSRF").checked = pref.ssrf_mitigation;
+                     $("blockPeersOnPrivilegedPorts").checked = pref.block_peers_on_privileged_ports;
++                    $("seedingOutgoingConnections").checked = pref.seeding_outgoing_connections;
+                     $("uploadSlotsBehavior").value = pref.upload_slots_behavior;
+                     $("uploadChokingAlgorithm").value = pref.upload_choking_algorithm;
+                     $("announceAllTrackers").checked = pref.announce_to_all_trackers;
+@@ -3071,6 +3080,7 @@ Use ';' to split multiple entries. Can use wildcard '*'.)QBT_TR[CONTEXT=OptionsD
+             settings["validate_https_tracker_certificate"] = $("validateHTTPSTrackerCertificate").checked;
+             settings["ssrf_mitigation"] = $("mitigateSSRF").checked;
+             settings["block_peers_on_privileged_ports"] = $("blockPeersOnPrivilegedPorts").checked;
++            settings["seeding_outgoing_connections"] = $("seedingOutgoingConnections").checked;
+             settings["upload_slots_behavior"] = Number($("uploadSlotsBehavior").value);
+             settings["upload_choking_algorithm"] = Number($("uploadChokingAlgorithm").value);
+             settings["announce_to_all_trackers"] = $("announceAllTrackers").checked;
+-- 
+2.47.3
+

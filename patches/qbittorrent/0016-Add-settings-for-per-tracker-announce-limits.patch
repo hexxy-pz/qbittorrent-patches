@@ -1,0 +1,435 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anonymous <anonymous@localhost>
+Date: Fri, 02 Oct 2026 17:54:33 +0000
+Subject: [PATCH 16/20] Add settings for per-tracker announce limits
+
+Exposes the tracker settings of the libtorrent tracker pool patch
+(tracker_http_pool, tracker_http2, tracker_host_max_concurrency,
+tracker_host_max_streams, tracker_stopped_concurrency,
+tracker_failure_threshold, tracker_connect_timeout, tracker_queue_timeout,
+tracker_host_max_queue) as Session settings,
+WebAPI preferences and WebUI Advanced options.
+---
+ src/base/bittorrent/session.h                |  18 +++
+ src/base/bittorrent/sessionimpl.cpp          | 154 +++++++++++++++++++
+ src/base/bittorrent/sessionimpl.h            |  27 ++++
+ src/webui/api/appcontroller.cpp              |  27 ++++
+ src/webui/www/private/views/preferences.html |  90 +++++++++++
+ 5 files changed, 316 insertions(+)
+
+diff --git a/src/base/bittorrent/session.h b/src/base/bittorrent/session.h
+index bd98417..a22629a 100644
+--- a/src/base/bittorrent/session.h
++++ b/src/base/bittorrent/session.h
+@@ -397,6 +397,24 @@ namespace BitTorrent
+         virtual void setAnnouncePort(int port) = 0;
+         virtual int maxConcurrentHTTPAnnounces() const = 0;
+         virtual void setMaxConcurrentHTTPAnnounces(int value) = 0;
++        virtual bool isTrackerConnectionPoolEnabled() const = 0;
++        virtual void setTrackerConnectionPoolEnabled(bool enabled) = 0;
++        virtual bool isTrackerHTTP2Enabled() const = 0;
++        virtual void setTrackerHTTP2Enabled(bool enabled) = 0;
++        virtual int trackerMaxConnectionsPerHost() const = 0;
++        virtual void setTrackerMaxConnectionsPerHost(int value) = 0;
++        virtual int trackerMaxStreamsPerHost() const = 0;
++        virtual void setTrackerMaxStreamsPerHost(int value) = 0;
++        virtual int trackerMaxStoppedPerHost() const = 0;
++        virtual void setTrackerMaxStoppedPerHost(int value) = 0;
++        virtual int trackerFailureThreshold() const = 0;
++        virtual void setTrackerFailureThreshold(int value) = 0;
++        virtual int trackerConnectTimeout() const = 0;
++        virtual void setTrackerConnectTimeout(int value) = 0;
++        virtual int trackerQueueTimeout() const = 0;
++        virtual void setTrackerQueueTimeout(int value) = 0;
++        virtual int trackerMaxQueuedPerHost() const = 0;
++        virtual void setTrackerMaxQueuedPerHost(int value) = 0;
+         virtual bool isReannounceWhenAddressChangedEnabled() const = 0;
+         virtual void setReannounceWhenAddressChangedEnabled(bool enabled) = 0;
+         virtual void reannounceToAllTrackers() const = 0;
+diff --git a/src/base/bittorrent/sessionimpl.cpp b/src/base/bittorrent/sessionimpl.cpp
+index 67dea89..401f4e7 100644
+--- a/src/base/bittorrent/sessionimpl.cpp
++++ b/src/base/bittorrent/sessionimpl.cpp
+@@ -447,6 +447,15 @@ SessionImpl::SessionImpl(QObject *parent)
+     , m_announceIP(BITTORRENT_SESSION_KEY(u"AnnounceIP"_s))
+     , m_announcePort(BITTORRENT_SESSION_KEY(u"AnnouncePort"_s), 0)
+     , m_maxConcurrentHTTPAnnounces(BITTORRENT_SESSION_KEY(u"MaxConcurrentHTTPAnnounces"_s), 50)
++    , m_isTrackerConnectionPoolEnabled(BITTORRENT_SESSION_KEY(u"TrackerConnectionPool"_s), true)
++    , m_isTrackerHTTP2Enabled(BITTORRENT_SESSION_KEY(u"TrackerHTTP2"_s), true)
++    , m_trackerMaxConnectionsPerHost(BITTORRENT_SESSION_KEY(u"TrackerMaxConnectionsPerHost"_s), 32)
++    , m_trackerMaxStreamsPerHost(BITTORRENT_SESSION_KEY(u"TrackerMaxStreamsPerHost"_s), 250)
++    , m_trackerMaxStoppedPerHost(BITTORRENT_SESSION_KEY(u"TrackerMaxStoppedAnnouncesPerHost"_s), 256)
++    , m_trackerFailureThreshold(BITTORRENT_SESSION_KEY(u"TrackerFailureThreshold"_s), 5)
++    , m_trackerConnectTimeout(BITTORRENT_SESSION_KEY(u"TrackerConnectTimeout"_s), 10)
++    , m_trackerQueueTimeout(BITTORRENT_SESSION_KEY(u"TrackerQueueTimeout"_s), 600)
++    , m_trackerMaxQueuedPerHost(BITTORRENT_SESSION_KEY(u"TrackerMaxQueuedPerHost"_s), 20000)
+     , m_isReannounceWhenAddressChangedEnabled(BITTORRENT_SESSION_KEY(u"ReannounceWhenAddressChanged"_s), false)
+     , m_stopTrackerTimeout(BITTORRENT_SESSION_KEY(u"StopTrackerTimeout"_s), 2)
+     , m_maxConnections(BITTORRENT_SESSION_KEY(u"MaxConnections"_s), 500, lowerLimited(0, -1))
+@@ -2016,6 +2025,16 @@ lt::settings_pack SessionImpl::loadLTSettings() const
+ #endif
+     // Max concurrent HTTP announces
+     settingsPack.set_int(lt::settings_pack::max_concurrent_http_announces, maxConcurrentHTTPAnnounces());
++    // Per-tracker announce limits and transport (libtorrent patch 0002)
++    settingsPack.set_bool(lt::settings_pack::tracker_http_pool, isTrackerConnectionPoolEnabled());
++    settingsPack.set_bool(lt::settings_pack::tracker_http2, isTrackerHTTP2Enabled());
++    settingsPack.set_int(lt::settings_pack::tracker_host_max_concurrency, trackerMaxConnectionsPerHost());
++    settingsPack.set_int(lt::settings_pack::tracker_host_max_streams, trackerMaxStreamsPerHost());
++    settingsPack.set_int(lt::settings_pack::tracker_stopped_concurrency, trackerMaxStoppedPerHost());
++    settingsPack.set_int(lt::settings_pack::tracker_failure_threshold, trackerFailureThreshold());
++    settingsPack.set_int(lt::settings_pack::tracker_connect_timeout, trackerConnectTimeout());
++    settingsPack.set_int(lt::settings_pack::tracker_queue_timeout, trackerQueueTimeout());
++    settingsPack.set_int(lt::settings_pack::tracker_host_max_queue, trackerMaxQueuedPerHost());
+     // Stop tracker timeout
+     settingsPack.set_int(lt::settings_pack::stop_tracker_timeout, stopTrackerTimeout());
+     // * Max connections limit
+@@ -4972,6 +4991,141 @@ void SessionImpl::setMaxConcurrentHTTPAnnounces(const int value)
+     configureDeferred();
+ }
+ 
++bool SessionImpl::isTrackerConnectionPoolEnabled() const
++{
++    return m_isTrackerConnectionPoolEnabled;
++}
++
++void SessionImpl::setTrackerConnectionPoolEnabled(const bool enabled)
++{
++    const bool v = enabled;
++    if (v == m_isTrackerConnectionPoolEnabled)
++        return;
++
++    m_isTrackerConnectionPoolEnabled = v;
++    configureDeferred();
++}
++
++bool SessionImpl::isTrackerHTTP2Enabled() const
++{
++    return m_isTrackerHTTP2Enabled;
++}
++
++void SessionImpl::setTrackerHTTP2Enabled(const bool enabled)
++{
++    const bool v = enabled;
++    if (v == m_isTrackerHTTP2Enabled)
++        return;
++
++    m_isTrackerHTTP2Enabled = v;
++    configureDeferred();
++}
++
++int SessionImpl::trackerMaxConnectionsPerHost() const
++{
++    return m_trackerMaxConnectionsPerHost;
++}
++
++void SessionImpl::setTrackerMaxConnectionsPerHost(const int value)
++{
++    const int v = std::max(1, value);
++    if (v == m_trackerMaxConnectionsPerHost)
++        return;
++
++    m_trackerMaxConnectionsPerHost = v;
++    configureDeferred();
++}
++
++int SessionImpl::trackerMaxStreamsPerHost() const
++{
++    return m_trackerMaxStreamsPerHost;
++}
++
++void SessionImpl::setTrackerMaxStreamsPerHost(const int value)
++{
++    const int v = std::max(1, value);
++    if (v == m_trackerMaxStreamsPerHost)
++        return;
++
++    m_trackerMaxStreamsPerHost = v;
++    configureDeferred();
++}
++
++int SessionImpl::trackerMaxStoppedPerHost() const
++{
++    return m_trackerMaxStoppedPerHost;
++}
++
++void SessionImpl::setTrackerMaxStoppedPerHost(const int value)
++{
++    const int v = std::max(1, value);
++    if (v == m_trackerMaxStoppedPerHost)
++        return;
++
++    m_trackerMaxStoppedPerHost = v;
++    configureDeferred();
++}
++
++int SessionImpl::trackerFailureThreshold() const
++{
++    return m_trackerFailureThreshold;
++}
++
++void SessionImpl::setTrackerFailureThreshold(const int value)
++{
++    const int v = std::max(1, value);
++    if (v == m_trackerFailureThreshold)
++        return;
++
++    m_trackerFailureThreshold = v;
++    configureDeferred();
++}
++
++int SessionImpl::trackerConnectTimeout() const
++{
++    return m_trackerConnectTimeout;
++}
++
++void SessionImpl::setTrackerConnectTimeout(const int value)
++{
++    const int v = std::max(1, value);
++    if (v == m_trackerConnectTimeout)
++        return;
++
++    m_trackerConnectTimeout = v;
++    configureDeferred();
++}
++
++int SessionImpl::trackerQueueTimeout() const
++{
++    return m_trackerQueueTimeout;
++}
++
++void SessionImpl::setTrackerQueueTimeout(const int value)
++{
++    const int v = std::max(1, value);
++    if (v == m_trackerQueueTimeout)
++        return;
++
++    m_trackerQueueTimeout = v;
++    configureDeferred();
++}
++
++int SessionImpl::trackerMaxQueuedPerHost() const
++{
++    return m_trackerMaxQueuedPerHost;
++}
++
++void SessionImpl::setTrackerMaxQueuedPerHost(const int value)
++{
++    const int v = std::max(1, value);
++    if (v == m_trackerMaxQueuedPerHost)
++        return;
++
++    m_trackerMaxQueuedPerHost = v;
++    configureDeferred();
++}
++
+ bool SessionImpl::isReannounceWhenAddressChangedEnabled() const
+ {
+     return m_isReannounceWhenAddressChangedEnabled;
+diff --git a/src/base/bittorrent/sessionimpl.h b/src/base/bittorrent/sessionimpl.h
+index 9ef9807..e54eabe 100644
+--- a/src/base/bittorrent/sessionimpl.h
++++ b/src/base/bittorrent/sessionimpl.h
+@@ -365,6 +365,24 @@ namespace BitTorrent
+         void setAnnouncePort(int port) override;
+         int maxConcurrentHTTPAnnounces() const override;
+         void setMaxConcurrentHTTPAnnounces(int value) override;
++        bool isTrackerConnectionPoolEnabled() const override;
++        void setTrackerConnectionPoolEnabled(bool enabled) override;
++        bool isTrackerHTTP2Enabled() const override;
++        void setTrackerHTTP2Enabled(bool enabled) override;
++        int trackerMaxConnectionsPerHost() const override;
++        void setTrackerMaxConnectionsPerHost(int value) override;
++        int trackerMaxStreamsPerHost() const override;
++        void setTrackerMaxStreamsPerHost(int value) override;
++        int trackerMaxStoppedPerHost() const override;
++        void setTrackerMaxStoppedPerHost(int value) override;
++        int trackerFailureThreshold() const override;
++        void setTrackerFailureThreshold(int value) override;
++        int trackerConnectTimeout() const override;
++        void setTrackerConnectTimeout(int value) override;
++        int trackerQueueTimeout() const override;
++        void setTrackerQueueTimeout(int value) override;
++        int trackerMaxQueuedPerHost() const override;
++        void setTrackerMaxQueuedPerHost(int value) override;
+         bool isReannounceWhenAddressChangedEnabled() const override;
+         void setReannounceWhenAddressChangedEnabled(bool enabled) override;
+         void reannounceToAllTrackers() const override;
+@@ -677,6 +695,15 @@ namespace BitTorrent
+         CachedSettingValue<QString> m_announceIP;
+         CachedSettingValue<int> m_announcePort;
+         CachedSettingValue<int> m_maxConcurrentHTTPAnnounces;
++        CachedSettingValue<bool> m_isTrackerConnectionPoolEnabled;
++        CachedSettingValue<bool> m_isTrackerHTTP2Enabled;
++        CachedSettingValue<int> m_trackerMaxConnectionsPerHost;
++        CachedSettingValue<int> m_trackerMaxStreamsPerHost;
++        CachedSettingValue<int> m_trackerMaxStoppedPerHost;
++        CachedSettingValue<int> m_trackerFailureThreshold;
++        CachedSettingValue<int> m_trackerConnectTimeout;
++        CachedSettingValue<int> m_trackerQueueTimeout;
++        CachedSettingValue<int> m_trackerMaxQueuedPerHost;
+         CachedSettingValue<bool> m_isReannounceWhenAddressChangedEnabled;
+         CachedSettingValue<int> m_stopTrackerTimeout;
+         CachedSettingValue<int> m_maxConnections;
+diff --git a/src/webui/api/appcontroller.cpp b/src/webui/api/appcontroller.cpp
+index 89f7868..7f099b3 100644
+--- a/src/webui/api/appcontroller.cpp
++++ b/src/webui/api/appcontroller.cpp
+@@ -477,6 +477,15 @@ void AppController::preferencesAction()
+     data[u"announce_ip"_s] = session->announceIP();
+     data[u"announce_port"_s] = session->announcePort();
+     data[u"max_concurrent_http_announces"_s] = session->maxConcurrentHTTPAnnounces();
++    data[u"tracker_connection_pool"_s] = session->isTrackerConnectionPoolEnabled();
++    data[u"tracker_http2"_s] = session->isTrackerHTTP2Enabled();
++    data[u"tracker_max_connections_per_host"_s] = session->trackerMaxConnectionsPerHost();
++    data[u"tracker_max_streams_per_host"_s] = session->trackerMaxStreamsPerHost();
++    data[u"tracker_max_stopped_per_host"_s] = session->trackerMaxStoppedPerHost();
++    data[u"tracker_failure_threshold"_s] = session->trackerFailureThreshold();
++    data[u"tracker_connect_timeout"_s] = session->trackerConnectTimeout();
++    data[u"tracker_queue_timeout"_s] = session->trackerQueueTimeout();
++    data[u"tracker_max_queued_per_host"_s] = session->trackerMaxQueuedPerHost();
+     data[u"stop_tracker_timeout"_s] = session->stopTrackerTimeout();
+     // Peer Turnover
+     data[u"peer_turnover"_s] = session->peerTurnover();
+@@ -1154,6 +1163,24 @@ void AppController::setPreferencesAction()
+         session->setAnnouncePort(it.value().toInt());
+     if (hasKey(u"max_concurrent_http_announces"_s))
+         session->setMaxConcurrentHTTPAnnounces(it.value().toInt());
++    if (hasKey(u"tracker_connection_pool"_s))
++        session->setTrackerConnectionPoolEnabled(it.value().toBool());
++    if (hasKey(u"tracker_http2"_s))
++        session->setTrackerHTTP2Enabled(it.value().toBool());
++    if (hasKey(u"tracker_max_connections_per_host"_s))
++        session->setTrackerMaxConnectionsPerHost(it.value().toInt());
++    if (hasKey(u"tracker_max_streams_per_host"_s))
++        session->setTrackerMaxStreamsPerHost(it.value().toInt());
++    if (hasKey(u"tracker_max_stopped_per_host"_s))
++        session->setTrackerMaxStoppedPerHost(it.value().toInt());
++    if (hasKey(u"tracker_failure_threshold"_s))
++        session->setTrackerFailureThreshold(it.value().toInt());
++    if (hasKey(u"tracker_connect_timeout"_s))
++        session->setTrackerConnectTimeout(it.value().toInt());
++    if (hasKey(u"tracker_queue_timeout"_s))
++        session->setTrackerQueueTimeout(it.value().toInt());
++    if (hasKey(u"tracker_max_queued_per_host"_s))
++        session->setTrackerMaxQueuedPerHost(it.value().toInt());
+     if (hasKey(u"stop_tracker_timeout"_s))
+         session->setStopTrackerTimeout(it.value().toInt());
+     // Peer Turnover
+diff --git a/src/webui/www/private/views/preferences.html b/src/webui/www/private/views/preferences.html
+index cb93257..62f2137 100644
+--- a/src/webui/www/private/views/preferences.html
++++ b/src/webui/www/private/views/preferences.html
+@@ -1649,6 +1649,78 @@ Use ';' to split multiple entries. Can use wildcard '*'.)QBT_TR[CONTEXT=OptionsD
+                         <input type="text" id="maxConcurrentHTTPAnnounces" style="width: 15em;">
+                     </td>
+                 </tr>
++                <tr>
++                    <td>
++                        <label for="trackerConnectionPool">QBT_TR(Keep connections to trackers open (connection pool):)QBT_TR[CONTEXT=OptionsDialog]</label>
++                    </td>
++                    <td>
++                        <input type="checkbox" id="trackerConnectionPool">
++                    </td>
++                </tr>
++                <tr>
++                    <td>
++                        <label for="trackerHTTP2">QBT_TR(Use HTTP/2 with trackers that support it:)QBT_TR[CONTEXT=OptionsDialog]</label>
++                    </td>
++                    <td>
++                        <input type="checkbox" id="trackerHTTP2">
++                    </td>
++                </tr>
++                <tr>
++                    <td>
++                        <label for="trackerMaxConnectionsPerHost">QBT_TR(Max connections per tracker (HTTP/1.1):)QBT_TR[CONTEXT=OptionsDialog]</label>
++                    </td>
++                    <td>
++                        <input type="text" id="trackerMaxConnectionsPerHost" style="width: 15em;">
++                    </td>
++                </tr>
++                <tr>
++                    <td>
++                        <label for="trackerMaxStreamsPerHost">QBT_TR(Max concurrent requests per tracker (HTTP/2):)QBT_TR[CONTEXT=OptionsDialog]</label>
++                    </td>
++                    <td>
++                        <input type="text" id="trackerMaxStreamsPerHost" style="width: 15em;">
++                    </td>
++                </tr>
++                <tr>
++                    <td>
++                        <label for="trackerMaxStoppedPerHost">QBT_TR(Max concurrent "stopped" announces per tracker:)QBT_TR[CONTEXT=OptionsDialog]</label>
++                    </td>
++                    <td>
++                        <input type="text" id="trackerMaxStoppedPerHost" style="width: 15em;">
++                    </td>
++                </tr>
++                <tr>
++                    <td>
++                        <label for="trackerFailureThreshold">QBT_TR(Failures in a row before a tracker is treated as down:)QBT_TR[CONTEXT=OptionsDialog]</label>
++                    </td>
++                    <td>
++                        <input type="text" id="trackerFailureThreshold" style="width: 15em;">
++                    </td>
++                </tr>
++                <tr>
++                    <td>
++                        <label for="trackerConnectTimeout">QBT_TR(Tracker connect timeout (seconds):)QBT_TR[CONTEXT=OptionsDialog]</label>
++                    </td>
++                    <td>
++                        <input type="text" id="trackerConnectTimeout" style="width: 15em;">
++                    </td>
++                </tr>
++                <tr>
++                    <td>
++                        <label for="trackerQueueTimeout">QBT_TR(Max time a tracker request may wait in its tracker's queue (seconds):)QBT_TR[CONTEXT=OptionsDialog]</label>
++                    </td>
++                    <td>
++                        <input type="text" id="trackerQueueTimeout" style="width: 15em;">
++                    </td>
++                </tr>
++                <tr>
++                    <td>
++                        <label for="trackerMaxQueuedPerHost">QBT_TR(Max requests waiting per tracker:)QBT_TR[CONTEXT=OptionsDialog]</label>
++                    </td>
++                    <td>
++                        <input type="text" id="trackerMaxQueuedPerHost" style="width: 15em;">
++                    </td>
++                </tr>
+                 <tr>
+                     <td>
+                         <label for="stopTrackerTimeout">QBT_TR(Stop tracker timeout [0: disabled]:)QBT_TR[CONTEXT=OptionsDialog]&nbsp;<a href="https://www.libtorrent.org/reference-Settings.html#stop_tracker_timeout" target="_blank">(?)</a></label>
+@@ -2617,6 +2689,15 @@ Use ';' to split multiple entries. Can use wildcard '*'.)QBT_TR[CONTEXT=OptionsD
+                     $("announceIP").value = pref.announce_ip;
+                     $("announcePort").value = pref.announce_port;
+                     $("maxConcurrentHTTPAnnounces").value = pref.max_concurrent_http_announces;
++                    $("trackerConnectionPool").checked = pref.tracker_connection_pool;
++                    $("trackerHTTP2").checked = pref.tracker_http2;
++                    $("trackerMaxConnectionsPerHost").value = pref.tracker_max_connections_per_host;
++                    $("trackerMaxStreamsPerHost").value = pref.tracker_max_streams_per_host;
++                    $("trackerMaxStoppedPerHost").value = pref.tracker_max_stopped_per_host;
++                    $("trackerFailureThreshold").value = pref.tracker_failure_threshold;
++                    $("trackerConnectTimeout").value = pref.tracker_connect_timeout;
++                    $("trackerQueueTimeout").value = pref.tracker_queue_timeout;
++                    $("trackerMaxQueuedPerHost").value = pref.tracker_max_queued_per_host;
+                     $("stopTrackerTimeout").value = pref.stop_tracker_timeout;
+                     $("peerTurnover").value = pref.peer_turnover;
+                     $("peerTurnoverCutoff").value = pref.peer_turnover_cutoff;
+@@ -3093,6 +3174,15 @@ Use ';' to split multiple entries. Can use wildcard '*'.)QBT_TR[CONTEXT=OptionsD
+             }
+             settings["announce_port"] = announcePort;
+             settings["max_concurrent_http_announces"] = Number($("maxConcurrentHTTPAnnounces").value);
++            settings["tracker_connection_pool"] = $("trackerConnectionPool").checked;
++            settings["tracker_http2"] = $("trackerHTTP2").checked;
++            settings["tracker_max_connections_per_host"] = Number($("trackerMaxConnectionsPerHost").value);
++            settings["tracker_max_streams_per_host"] = Number($("trackerMaxStreamsPerHost").value);
++            settings["tracker_max_stopped_per_host"] = Number($("trackerMaxStoppedPerHost").value);
++            settings["tracker_failure_threshold"] = Number($("trackerFailureThreshold").value);
++            settings["tracker_connect_timeout"] = Number($("trackerConnectTimeout").value);
++            settings["tracker_queue_timeout"] = Number($("trackerQueueTimeout").value);
++            settings["tracker_max_queued_per_host"] = Number($("trackerMaxQueuedPerHost").value);
+             settings["stop_tracker_timeout"] = Number($("stopTrackerTimeout").value);
+             settings["peer_turnover"] = Number($("peerTurnover").value);
+             settings["peer_turnover_cutoff"] = Number($("peerTurnoverCutoff").value);
+-- 
+2.47.3
+

@@ -1,0 +1,65 @@
+From 7ee5b9807ea6c27250836493793ce082a2ce2a40 Mon Sep 17 00:00:00 2001
+From: tehcneko <chsqwyx@gmail.com>
+Date: Sun, 30 Nov 2025 19:13:10 +0800
+Subject: [PATCH 11/12] WebUI: Fix row collapsing with virtual list enabled
+
+Fixes https://github.com/qbittorrent/qBittorrent/issues/23241#issuecomment-3295352816.
+PR #23542.
+
+(cherry picked from commit 564afc975f1bb2c9220381e7d122297f3eef5623)
+
+Backport to 5.1.4: only the rerender after expanding/collapsing all nodes and the
+prop-files current_hash reset. 5.1.4's files table already filters collapsed rows through
+_filterNodes() and keys rows by node.rowId.
+---
+ src/webui/www/private/scripts/dynamicTable.js | 6 ++++++
+ src/webui/www/private/scripts/prop-files.js   | 2 ++
+ 2 files changed, 8 insertions(+)
+
+diff --git a/src/webui/www/private/scripts/dynamicTable.js b/src/webui/www/private/scripts/dynamicTable.js
+index cf6b06d29..e9547aa49 100644
+--- a/src/webui/www/private/scripts/dynamicTable.js
++++ b/src/webui/www/private/scripts/dynamicTable.js
+@@ -2626,6 +2626,9 @@ window.qBittorrent.DynamicTable ??= (() => {
+         expandAllNodes: function() {
+             for (const [key, _] of this.collapseState)
+                 this.expandNode(key);
++
++            if (this.useVirtualList)
++                this.rerender();
+         },
+ 
+         collapseAllNodes: function() {
+@@ -2634,6 +2637,9 @@ window.qBittorrent.DynamicTable ??= (() => {
+                 if (state.depth >= 1)
+                     this.collapseNode(key);
+             }
++
++            if (this.useVirtualList)
++                this.rerender();
+         },
+ 
+         _updateNodeVisibility: (node, shouldHide) => {
+diff --git a/src/webui/www/private/scripts/prop-files.js b/src/webui/www/private/scripts/prop-files.js
+index 3688037a9..f7503da5c 100644
+--- a/src/webui/www/private/scripts/prop-files.js
++++ b/src/webui/www/private/scripts/prop-files.js
+@@ -313,6 +313,7 @@ window.qBittorrent.PropFiles ??= (() => {
+         const new_hash = torrentsTable.getCurrentTorrentID();
+         if (new_hash === "") {
+             torrentFilesTable.clear();
++            current_hash = "";
+             clearTimeout(loadTorrentFilesDataTimer);
+             return;
+         }
+@@ -614,6 +615,7 @@ window.qBittorrent.PropFiles ??= (() => {
+ 
+     const clear = () => {
+         torrentFilesTable.clear();
++        current_hash = "";
+     };
+ 
+     return exports();
+-- 
+2.47.3
+

@@ -1,0 +1,387 @@
+From 4596fde3e72c1d545b97ab714de4fe7b05ab01b5 Mon Sep 17 00:00:00 2001
+From: Tom Piccirello <8296030+Piccirello@users.noreply.github.com>
+Date: Thu, 26 Feb 2026 05:29:08 -0800
+Subject: [PATCH 12/12] WebUI: Fix header text displayed in table in Firefox
+
+When using virtual rows, header text was incorrectly displayed in the table. This only occurred when using Firefox. To fix this, we now use a colgroup to define column width instead of a hidden thead element. This results in correct behavior across all browsers.
+
+PR #23861.
+
+(cherry picked from commit 3ee3d41615c9879e640729a12632eb955e212d9a)
+
+Backport to 5.1.4: addtorrent.html and torrentcreator.html do not exist in 5.1.4; the RSS
+tables' own newColumn() copies get the colgroup change as well; rowHeight stays 26 (5.1.4
+has no display density setting).
+---
+ src/webui/www/private/css/dynamicTable.css    |  7 ---
+ src/webui/www/private/css/style.css           |  4 --
+ src/webui/www/private/rename_files.html       |  3 --
+ src/webui/www/private/scripts/dynamicTable.js | 44 +++++++++++++------
+ src/webui/www/private/views/log.html          |  6 ---
+ src/webui/www/private/views/properties.html   | 12 -----
+ src/webui/www/private/views/rss.html          |  6 ---
+ .../www/private/views/rssDownloader.html      |  9 ----
+ src/webui/www/private/views/search.html       |  3 --
+ .../www/private/views/searchplugins.html      |  7 ---
+ src/webui/www/private/views/transferlist.html |  3 --
+ 11 files changed, 30 insertions(+), 74 deletions(-)
+
+diff --git a/src/webui/www/private/css/dynamicTable.css b/src/webui/www/private/css/dynamicTable.css
+index 9ca435394..70e906fd3 100644
+--- a/src/webui/www/private/css/dynamicTable.css
++++ b/src/webui/www/private/css/dynamicTable.css
+@@ -155,13 +155,6 @@ div:has(> div.dynamicTableFixedHeaderDiv):not(.invisible) {
+     overflow: auto;
+ }
+ 
+-.dynamicTableDiv thead th {
+-    height: 0 !important;
+-    line-height: 0 !important;
+-    padding-bottom: 0 !important;
+-    padding-top: 0 !important;
+-}
+-
+ /* Trackers table */
+ #torrentTrackersTableDiv tr:not(.selected, :hover) {
+     & .trackerDisabled {
+diff --git a/src/webui/www/private/css/style.css b/src/webui/www/private/css/style.css
+index f28e0a5cf..37b60c9d9 100644
+--- a/src/webui/www/private/css/style.css
++++ b/src/webui/www/private/css/style.css
+@@ -871,10 +871,6 @@ td.statusBarSeparator {
+     height: calc(100% - 26px) !important;
+ }
+ 
+-#searchResults .dynamicTable {
+-    width: 100%;
+-}
+-
+ #searchResults .numSearchResults {
+     font-style: italic;
+ }
+diff --git a/src/webui/www/private/rename_files.html b/src/webui/www/private/rename_files.html
+index 9d003a33d..9ac7063be 100644
+--- a/src/webui/www/private/rename_files.html
++++ b/src/webui/www/private/rename_files.html
+@@ -466,9 +466,6 @@
+             </div>
+             <div id="bulkRenameFilesTableDiv" class="dynamicTableDiv">
+                 <table class="dynamicTable">
+-                    <thead>
+-                        <tr class="dynamicTableHeader"></tr>
+-                    </thead>
+                     <tbody></tbody>
+                 </table>
+             </div>
+diff --git a/src/webui/www/private/scripts/dynamicTable.js b/src/webui/www/private/scripts/dynamicTable.js
+index e9547aa49..df8804f6f 100644
+--- a/src/webui/www/private/scripts/dynamicTable.js
++++ b/src/webui/www/private/scripts/dynamicTable.js
+@@ -76,9 +76,10 @@ window.qBittorrent.DynamicTable ??= (() => {
+             this.dynamicTableDiv = document.getElementById(dynamicTableDivId);
+             this.useVirtualList = useVirtualList && (LocalPreferences.get("use_virtual_list", "false") === "true");
+             this.fixedTableHeader = document.querySelector(`#${dynamicTableFixedHeaderDivId} thead tr`);
+-            this.hiddenTableHeader = this.dynamicTableDiv.querySelector(`thead tr`);
+-            this.table = this.dynamicTableDiv.querySelector(`table`);
+-            this.tableBody = this.dynamicTableDiv.querySelector(`tbody`);
++            this.table = this.dynamicTableDiv.querySelector("table");
++            this.colgroup = document.createElement("colgroup");
++            this.table.prepend(this.colgroup);
++            this.tableBody = this.dynamicTableDiv.querySelector("tbody");
+             this.rowHeight = 26;
+             this.rows = new Map();
+             this.cachedElements = [];
+@@ -407,7 +408,7 @@ window.qBittorrent.DynamicTable ??= (() => {
+ 
+         _calculateColumnBodyWidth: function(column) {
+             const columnIndex = this.getColumnPos(column.name);
+-            const bodyColumn = document.getElementById(this.dynamicTableDivId).querySelectorAll("tr>th")[columnIndex];
++            const bodyColumn = this.getRowCells(this.fixedTableHeader)[columnIndex];
+             const canvas = document.createElement("canvas");
+             const context = canvas.getContext("2d");
+             context.font = window.getComputedStyle(bodyColumn, null).getPropertyValue("font");
+@@ -435,8 +436,8 @@ window.qBittorrent.DynamicTable ??= (() => {
+ 
+             const pos = this.getColumnPos(column.name);
+             const style = `width: ${column.width}px; ${column.style}`;
+-            this.getRowCells(this.hiddenTableHeader)[pos].style.cssText = style;
+             this.getRowCells(this.fixedTableHeader)[pos].style.cssText = style;
++            this.colgroup.children[pos].style.width = `${column.width}px`;
+             // rerender on column resize
+             if (this.useVirtualList)
+                 this.rerender();
+@@ -601,7 +602,9 @@ window.qBittorrent.DynamicTable ??= (() => {
+             this.columns.push(column);
+             this.columns[name] = column;
+ 
+-            this.hiddenTableHeader.append(document.createElement("th"));
++            const col = document.createElement("col");
++            col.style.width = `${column.width}px`;
++            this.colgroup.append(col);
+             this.fixedTableHeader.append(document.createElement("th"));
+         },
+ 
+@@ -635,8 +638,12 @@ window.qBittorrent.DynamicTable ??= (() => {
+         },
+ 
+         updateTableHeaders: function() {
+-            this.updateHeader(this.hiddenTableHeader);
+             this.updateHeader(this.fixedTableHeader);
++            const cols = this.colgroup.children;
++            for (let i = 0; i < this.columns.length; ++i) {
++                cols[i].style.width = `${this.columns[i].width}px`;
++                cols[i].classList.toggle("invisible", !this.columns[i].isVisible());
++            }
+             this.setSortedColumnIcon(this.sortedColumn, null, (this.reverseSort === "1"));
+         },
+ 
+@@ -666,11 +673,10 @@ window.qBittorrent.DynamicTable ??= (() => {
+         updateColumn: function(columnName, updateCellData = false) {
+             const column = this.columns[columnName];
+             const pos = this.getColumnPos(columnName);
+-            const ths = this.getRowCells(this.hiddenTableHeader);
+             const fths = this.getRowCells(this.fixedTableHeader);
+             const action = column.isVisible() ? "remove" : "add";
+-            ths[pos].classList[action]("invisible");
+             fths[pos].classList[action]("invisible");
++            this.colgroup.children[pos].classList[action]("invisible");
+ 
+             for (const tr of this.getTrs()) {
+                 const td = this.getRowCells(tr)[pos];
+@@ -3202,7 +3208,9 @@ window.qBittorrent.DynamicTable ??= (() => {
+             this.columns.push(column);
+             this.columns[name] = column;
+ 
+-            this.hiddenTableHeader.append(document.createElement("th"));
++            const col = document.createElement("col");
++            col.style.width = `${column.width}px`;
++            this.colgroup.append(col);
+             this.fixedTableHeader.append(document.createElement("th"));
+         }
+     });
+@@ -3290,7 +3298,9 @@ window.qBittorrent.DynamicTable ??= (() => {
+             this.columns.push(column);
+             this.columns[name] = column;
+ 
+-            this.hiddenTableHeader.append(document.createElement("th"));
++            const col = document.createElement("col");
++            col.style.width = `${column.width}px`;
++            this.colgroup.append(col);
+             this.fixedTableHeader.append(document.createElement("th"));
+         }
+     });
+@@ -3374,7 +3384,9 @@ window.qBittorrent.DynamicTable ??= (() => {
+             this.columns.push(column);
+             this.columns[name] = column;
+ 
+-            this.hiddenTableHeader.append(document.createElement("th"));
++            const col = document.createElement("col");
++            col.style.width = `${column.width}px`;
++            this.colgroup.append(col);
+             this.fixedTableHeader.append(document.createElement("th"));
+         },
+         selectRow: function(rowId) {
+@@ -3460,7 +3472,9 @@ window.qBittorrent.DynamicTable ??= (() => {
+             this.columns.push(column);
+             this.columns[name] = column;
+ 
+-            this.hiddenTableHeader.append(document.createElement("th"));
++            const col = document.createElement("col");
++            col.style.width = `${column.width}px`;
++            this.colgroup.append(col);
+             this.fixedTableHeader.append(document.createElement("th"));
+         },
+         selectRow: () => {}
+@@ -3509,7 +3523,9 @@ window.qBittorrent.DynamicTable ??= (() => {
+             this.columns.push(column);
+             this.columns[name] = column;
+ 
+-            this.hiddenTableHeader.append(document.createElement("th"));
++            const col = document.createElement("col");
++            col.style.width = `${column.width}px`;
++            this.colgroup.append(col);
+             this.fixedTableHeader.append(document.createElement("th"));
+         },
+         selectRow: () => {},
+diff --git a/src/webui/www/private/views/log.html b/src/webui/www/private/views/log.html
+index 99fe8660a..7b0accded 100644
+--- a/src/webui/www/private/views/log.html
++++ b/src/webui/www/private/views/log.html
+@@ -116,9 +116,6 @@
+             </div>
+             <div id="logMessageTableDiv" class="dynamicTableDiv">
+                 <table class="dynamicTable unselectable">
+-                    <thead>
+-                        <tr class="dynamicTableHeader"></tr>
+-                    </thead>
+                     <tbody></tbody>
+                 </table>
+             </div>
+@@ -133,9 +130,6 @@
+             </div>
+             <div id="logPeerTableDiv" class="dynamicTableDiv">
+                 <table class="dynamicTable unselectable">
+-                    <thead>
+-                        <tr class="dynamicTableHeader"></tr>
+-                    </thead>
+                     <tbody></tbody>
+                 </table>
+             </div>
+diff --git a/src/webui/www/private/views/properties.html b/src/webui/www/private/views/properties.html
+index fbcaa1d53..d67c9a9c8 100644
+--- a/src/webui/www/private/views/properties.html
++++ b/src/webui/www/private/views/properties.html
+@@ -112,9 +112,6 @@
+         </div>
+         <div id="torrentTrackersTableDiv" class="dynamicTableDiv">
+             <table class="dynamicTable">
+-                <thead>
+-                    <tr class="dynamicTableHeader"></tr>
+-                </thead>
+                 <tbody></tbody>
+             </table>
+         </div>
+@@ -132,9 +129,6 @@
+         </div>
+         <div id="torrentPeersTableDiv" class="dynamicTableDiv">
+             <table class="dynamicTable">
+-                <thead>
+-                    <tr class="dynamicTableHeader"></tr>
+-                </thead>
+                 <tbody></tbody>
+             </table>
+         </div>
+@@ -152,9 +146,6 @@
+         </div>
+         <div id="torrentWebseedsTableDiv" class="dynamicTableDiv">
+             <table class="dynamicTable">
+-                <thead>
+-                    <tr class="dynamicTableHeader"></tr>
+-                </thead>
+                 <tbody></tbody>
+             </table>
+         </div>
+@@ -172,9 +163,6 @@
+         </div>
+         <div id="torrentFilesTableDiv" class="dynamicTableDiv">
+             <table class="dynamicTable">
+-                <thead>
+-                    <tr class="dynamicTableHeader"></tr>
+-                </thead>
+                 <tbody></tbody>
+             </table>
+         </div>
+diff --git a/src/webui/www/private/views/rss.html b/src/webui/www/private/views/rss.html
+index 0e8a761f2..02c48b25c 100644
+--- a/src/webui/www/private/views/rss.html
++++ b/src/webui/www/private/views/rss.html
+@@ -133,9 +133,6 @@
+             </div>
+             <div id="rssFeedTableDiv" class="dynamicTableDiv">
+                 <table class="dynamicTable unselectable">
+-                    <thead>
+-                        <tr class="dynamicTableHeader"></tr>
+-                    </thead>
+                     <tbody></tbody>
+                 </table>
+             </div>
+@@ -150,9 +147,6 @@
+             </div>
+             <div id="rssArticleTableDiv" class="dynamicTableDiv">
+                 <table class="dynamicTable unselectable">
+-                    <thead>
+-                        <tr class="dynamicTableHeader"></tr>
+-                    </thead>
+                     <tbody></tbody>
+                 </table>
+             </div>
+diff --git a/src/webui/www/private/views/rssDownloader.html b/src/webui/www/private/views/rssDownloader.html
+index 4a0b8d6ce..7bdc2df67 100644
+--- a/src/webui/www/private/views/rssDownloader.html
++++ b/src/webui/www/private/views/rssDownloader.html
+@@ -149,9 +149,6 @@
+                 </div>
+                 <div id="rssDownloaderRuleTableDiv" class="dynamicTableDiv">
+                     <table class="dynamicTable unselectable">
+-                        <thead>
+-                            <tr class="dynamicTableHeader"></tr>
+-                        </thead>
+                         <tbody></tbody>
+                     </table>
+                 </div>
+@@ -297,9 +294,6 @@ Supports the formats: S01E01, 1x1, 2017.12.31 and 31.12.2017 (Date formats also
+                 </div>
+                 <div id="rssDownloaderFeedSelectionTableDiv" class="dynamicTableDiv">
+                     <table class="dynamicTable unselectable">
+-                        <thead>
+-                            <tr class="dynamicTableHeader"></tr>
+-                        </thead>
+                         <tbody></tbody>
+                     </table>
+                 </div>
+@@ -321,9 +315,6 @@ Supports the formats: S01E01, 1x1, 2017.12.31 and 31.12.2017 (Date formats also
+             </div>
+             <div id="rssDownloaderArticlesTableDiv" class="dynamicTableDiv">
+                 <table class="dynamicTable unselectable">
+-                    <thead>
+-                        <tr class="dynamicTableHeader"></tr>
+-                    </thead>
+                     <tbody></tbody>
+                 </table>
+             </div>
+diff --git a/src/webui/www/private/views/search.html b/src/webui/www/private/views/search.html
+index 187586c90..e5beaecf6 100644
+--- a/src/webui/www/private/views/search.html
++++ b/src/webui/www/private/views/search.html
+@@ -187,9 +187,6 @@
+         </div>
+         <div id="searchResultsTableDiv" class="dynamicTableDiv">
+             <table class="dynamicTable unselectable">
+-                <thead>
+-                    <tr class="dynamicTableHeader"></tr>
+-                </thead>
+                 <tbody></tbody>
+             </table>
+         </div>
+diff --git a/src/webui/www/private/views/searchplugins.html b/src/webui/www/private/views/searchplugins.html
+index 768b605fc..27bb606ee 100644
+--- a/src/webui/www/private/views/searchplugins.html
++++ b/src/webui/www/private/views/searchplugins.html
+@@ -19,10 +19,6 @@
+         height: calc(100% - 135px);
+     }
+ 
+-    #searchPluginsTable .dynamicTable {
+-        width: 100%;
+-    }
+-
+     #searchPluginsTableDiv {
+         height: calc(100% - 26px);
+     }
+@@ -50,9 +46,6 @@
+         </div>
+         <div id="searchPluginsTableDiv" class="dynamicTableDiv">
+             <table class="dynamicTable unselectable">
+-                <thead>
+-                    <tr class="dynamicTableHeader"></tr>
+-                </thead>
+                 <tbody></tbody>
+             </table>
+         </div>
+diff --git a/src/webui/www/private/views/transferlist.html b/src/webui/www/private/views/transferlist.html
+index c6feebbb5..d5a95266b 100644
+--- a/src/webui/www/private/views/transferlist.html
++++ b/src/webui/www/private/views/transferlist.html
+@@ -8,9 +8,6 @@
+ 
+ <div id="torrentsTableDiv" class="dynamicTableDiv">
+     <table class="dynamicTable unselectable">
+-        <thead>
+-            <tr class="dynamicTableHeader"></tr>
+-        </thead>
+         <tbody></tbody>
+     </table>
+ </div>
+-- 
+2.47.3
+

@@ -1,0 +1,54 @@
+From 39d42f11f664d9cd3611a6023c04ceeb609b79f1 Mon Sep 17 00:00:00 2001
+From: tehcneko <chsqwyx@gmail.com>
+Date: Mon, 2 Mar 2026 20:56:52 +0800
+Subject: [PATCH] WebUI: Enable virtual list by default
+
+PR #23887.
+
+(cherry picked from commit 18aa92a55216e7ab6339ab42c3f752f8ca84aec5)
+
+Backport to 5.1.4: the setting lives in LocalPreferences, so its default becomes "true"; an
+explicitly saved value still wins.
+---
+ src/webui/www/private/scripts/dynamicTable.js | 2 +-
+ src/webui/www/private/views/preferences.html  | 4 ++--
+ 2 files changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/src/webui/www/private/scripts/dynamicTable.js b/src/webui/www/private/scripts/dynamicTable.js
+index df8804f6f..4ad74a23f 100644
+--- a/src/webui/www/private/scripts/dynamicTable.js
++++ b/src/webui/www/private/scripts/dynamicTable.js
+@@ -74,7 +74,7 @@ window.qBittorrent.DynamicTable ??= (() => {
+             this.dynamicTableDivId = dynamicTableDivId;
+             this.dynamicTableFixedHeaderDivId = dynamicTableFixedHeaderDivId;
+             this.dynamicTableDiv = document.getElementById(dynamicTableDivId);
+-            this.useVirtualList = useVirtualList && (LocalPreferences.get("use_virtual_list", "false") === "true");
++            this.useVirtualList = useVirtualList && (LocalPreferences.get("use_virtual_list", "true") === "true");
+             this.fixedTableHeader = document.querySelector(`#${dynamicTableFixedHeaderDivId} thead tr`);
+             this.table = this.dynamicTableDiv.querySelector("table");
+             this.colgroup = document.createElement("colgroup");
+diff --git a/src/webui/www/private/views/preferences.html b/src/webui/www/private/views/preferences.html
+index fd6a5492d..5dea2670e 100644
+--- a/src/webui/www/private/views/preferences.html
++++ b/src/webui/www/private/views/preferences.html
+@@ -108,7 +108,7 @@
+         </div>
+         <div class="formRow" style="margin-bottom: 3px;">
+             <input type="checkbox" id="useVirtualList">
+-            <label for="useVirtualList">QBT_TR(Enable optimized table rendering (experimental))QBT_TR[CONTEXT=OptionsDialog]</label>
++            <label for="useVirtualList">QBT_TR(Enable optimized table rendering)QBT_TR[CONTEXT=OptionsDialog]</label>
+         </div>
+     </fieldset>
+ </div>
+@@ -2207,7 +2207,7 @@ Use ';' to split multiple entries. Can use wildcard '*'.)QBT_TR[CONTEXT=OptionsD
+                     $("statusBarExternalIP").checked = pref.status_bar_external_ip;
+                     $("performanceWarning").checked = pref.performance_warning;
+                     document.getElementById("displayFullURLTrackerColumn").checked = (LocalPreferences.get("full_url_tracker_column", "false") === "true");
+-                    document.getElementById("useVirtualList").checked = (LocalPreferences.get("use_virtual_list", "false") === "true");
++                    document.getElementById("useVirtualList").checked = (LocalPreferences.get("use_virtual_list", "true") === "true");
+                     document.getElementById("hideZeroFiltersCheckbox").checked = (LocalPreferences.get("hide_zero_status_filters", "false") === "true");
+                     $("dblclickDownloadSelect").value = LocalPreferences.get("dblclick_download", "1");
+                     $("dblclickCompleteSelect").value = LocalPreferences.get("dblclick_complete", "1");
+-- 
+2.47.3
+

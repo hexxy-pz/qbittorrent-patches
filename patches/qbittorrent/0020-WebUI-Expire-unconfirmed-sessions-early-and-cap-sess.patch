@@ -1,0 +1,370 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anonymous <anonymous@localhost>
+Date: Fri, 09 Oct 2026 02:05:08 +0000
+Subject: [PATCH 20/20] WebUI: Expire unconfirmed sessions early and cap
+ sessions
+
+Under the authentication bypass (localhost or a whitelisted subnet), every
+request without a session cookie started a new session, and each one kept its
+API state for the whole session timeout: a client calling sync/maindata
+without keeping cookies pinned a full snapshot (85-120 MB with ~9,000
+torrents) per call, an easy way to exhaust memory.
+
+A new session is now provisional until a request carries its cookie, and a
+provisional session expires early. Making room for a new session evicts the
+provisional session idle longest, or else the session idle longest, of the
+same client address beyond the per-client limit and of all beyond the total
+limit. Options (WebUI tab, WebAPI preferences, Preferences/WebUI/...):
+
+- ProvisionalSessionTimeout / web_ui_provisional_session_timeout: 60 s
+- MaxSessionsPerClient / web_ui_max_sessions_per_client: 8
+- MaxSessions / web_ui_max_sessions: 32
+---
+ src/base/preferences.cpp                     | 40 +++++++++++
+ src/base/preferences.h                       |  6 ++
+ src/webui/api/appcontroller.cpp              |  9 +++
+ src/webui/webapplication.cpp                 | 76 ++++++++++++++++++--
+ src/webui/webapplication.h                   | 17 ++++-
+ src/webui/www/private/views/preferences.html | 18 +++++
+ 6 files changed, 161 insertions(+), 5 deletions(-)
+
+diff --git a/src/base/preferences.cpp b/src/base/preferences.cpp
+index 8a443e9..886ef07 100644
+--- a/src/base/preferences.cpp
++++ b/src/base/preferences.cpp
+@@ -885,6 +885,46 @@ void Preferences::setWebUISessionTimeout(const int timeout)
+     setValue(u"Preferences/WebUI/SessionTimeout"_s, timeout);
+ }
+ 
++// how long a session lives until a request carries its cookie (capped by the session timeout)
++int Preferences::getWebUIProvisionalSessionTimeout() const
++{
++    return std::max(1, value<int>(u"Preferences/WebUI/ProvisionalSessionTimeout"_s, 60));
++}
++
++void Preferences::setWebUIProvisionalSessionTimeout(const int timeout)
++{
++    if (timeout == getWebUIProvisionalSessionTimeout())
++        return;
++
++    setValue(u"Preferences/WebUI/ProvisionalSessionTimeout"_s, std::max(1, timeout));
++}
++
++int Preferences::getWebUIMaxSessionsPerClient() const
++{
++    return std::max(1, value<int>(u"Preferences/WebUI/MaxSessionsPerClient"_s, 8));
++}
++
++void Preferences::setWebUIMaxSessionsPerClient(const int count)
++{
++    if (count == getWebUIMaxSessionsPerClient())
++        return;
++
++    setValue(u"Preferences/WebUI/MaxSessionsPerClient"_s, std::max(1, count));
++}
++
++int Preferences::getWebUIMaxSessions() const
++{
++    return std::max(1, value<int>(u"Preferences/WebUI/MaxSessions"_s, 32));
++}
++
++void Preferences::setWebUIMaxSessions(const int count)
++{
++    if (count == getWebUIMaxSessions())
++        return;
++
++    setValue(u"Preferences/WebUI/MaxSessions"_s, std::max(1, count));
++}
++
+ QString Preferences::getWebAPISessionCookieName() const
+ {
+     return value<QString>(u"WebAPI/SessionCookieName"_s);
+diff --git a/src/base/preferences.h b/src/base/preferences.h
+index 817a5ff..3548aff 100644
+--- a/src/base/preferences.h
++++ b/src/base/preferences.h
+@@ -209,6 +209,12 @@ public:
+     void setWebUIBanDuration(std::chrono::seconds duration);
+     int getWebUISessionTimeout() const;
+     void setWebUISessionTimeout(int timeout);
++    int getWebUIProvisionalSessionTimeout() const;
++    void setWebUIProvisionalSessionTimeout(int timeout);
++    int getWebUIMaxSessionsPerClient() const;
++    void setWebUIMaxSessionsPerClient(int count);
++    int getWebUIMaxSessions() const;
++    void setWebUIMaxSessions(int count);
+     QString getWebAPISessionCookieName() const;
+     void setWebAPISessionCookieName(const QString &cookieName);
+ 
+diff --git a/src/webui/api/appcontroller.cpp b/src/webui/api/appcontroller.cpp
+index eb0b397..e70cbcb 100644
+--- a/src/webui/api/appcontroller.cpp
++++ b/src/webui/api/appcontroller.cpp
+@@ -331,6 +331,9 @@ void AppController::preferencesAction()
+     data[u"web_ui_max_auth_fail_count"_s] = pref->getWebUIMaxAuthFailCount();
+     data[u"web_ui_ban_duration"_s] = static_cast<int>(pref->getWebUIBanDuration().count());
+     data[u"web_ui_session_timeout"_s] = pref->getWebUISessionTimeout();
++    data[u"web_ui_provisional_session_timeout"_s] = pref->getWebUIProvisionalSessionTimeout();
++    data[u"web_ui_max_sessions_per_client"_s] = pref->getWebUIMaxSessionsPerClient();
++    data[u"web_ui_max_sessions"_s] = pref->getWebUIMaxSessions();
+     // Use alternative WebUI
+     data[u"alternative_webui_enabled"_s] = pref->isAltWebUIEnabled();
+     data[u"alternative_webui_path"_s] = pref->getWebUIRootFolder().toString();
+@@ -921,6 +924,12 @@ void AppController::setPreferencesAction()
+         pref->setWebUIBanDuration(std::chrono::seconds {it.value().toInt()});
+     if (hasKey(u"web_ui_session_timeout"_s))
+         pref->setWebUISessionTimeout(it.value().toInt());
++    if (hasKey(u"web_ui_provisional_session_timeout"_s))
++        pref->setWebUIProvisionalSessionTimeout(it.value().toInt());
++    if (hasKey(u"web_ui_max_sessions_per_client"_s))
++        pref->setWebUIMaxSessionsPerClient(it.value().toInt());
++    if (hasKey(u"web_ui_max_sessions"_s))
++        pref->setWebUIMaxSessions(it.value().toInt());
+     // Use alternative WebUI
+     if (hasKey(u"alternative_webui_enabled"_s))
+         pref->setAltWebUIEnabled(it.value().toBool());
+diff --git a/src/webui/webapplication.cpp b/src/webui/webapplication.cpp
+index 74f582f..8f910c2 100644
+--- a/src/webui/webapplication.cpp
++++ b/src/webui/webapplication.cpp
+@@ -441,6 +441,9 @@ void WebApplication::configure()
+     m_isAuthSubnetWhitelistEnabled = pref->isWebUIAuthSubnetWhitelistEnabled();
+     m_authSubnetWhitelist = pref->getWebUIAuthSubnetWhitelist();
+     m_sessionTimeout = pref->getWebUISessionTimeout();
++    m_provisionalSessionTimeout = pref->getWebUIProvisionalSessionTimeout();
++    m_maxSessionsPerClient = pref->getWebUIMaxSessionsPerClient();
++    m_maxSessions = pref->getWebUIMaxSessions();
+ 
+     m_domainList = pref->getServerDomains().split(u';', Qt::SkipEmptyParts);
+     std::for_each(m_domainList.begin(), m_domainList.end(), [](QString &entry) { entry = entry.trimmed(); });
+@@ -658,7 +661,7 @@ void WebApplication::sessionInitialize()
+         m_currentSession = m_sessions.value(sessionId);
+         if (m_currentSession)
+         {
+-            if (m_currentSession->hasExpired(m_sessionTimeout))
++            if (m_currentSession->hasExpired(sessionTimeout(m_currentSession)))
+             {
+                 // session is outdated - removing it
+                 delete m_sessions.take(sessionId);
+@@ -666,6 +669,7 @@ void WebApplication::sessionInitialize()
+             }
+             else
+             {
++                m_currentSession->confirm();
+                 m_currentSession->updateTimestamp();
+             }
+         }
+@@ -716,7 +720,7 @@ void WebApplication::sessionStart()
+     // remove outdated sessions
+     Algorithm::removeIf(m_sessions, [this](const QString &, const WebSession *session)
+     {
+-        if (session->hasExpired(m_sessionTimeout))
++        if (session->hasExpired(sessionTimeout(session)))
+         {
+             delete session;
+             return true;
+@@ -725,7 +729,13 @@ void WebApplication::sessionStart()
+         return false;
+     });
+ 
+-    m_currentSession = new WebSession(generateSid(), app());
++    const auto isSameClient = [this](const WebSession *session) { return session->clientAddress() == m_clientAddress; };
++    while (std::count_if(m_sessions.cbegin(), m_sessions.cend(), isSameClient) >= m_maxSessionsPerClient)
++        evictSession(isSameClient);
++    while (m_sessions.size() >= m_maxSessions)
++        evictSession([](const WebSession *) { return true; });
++
++    m_currentSession = new WebSession(generateSid(), m_clientAddress, app());
+     m_sessions[m_currentSession->id()] = m_currentSession;
+ 
+     m_currentSession->registerAPIController(u"app"_s, new AppController(app(), m_currentSession));
+@@ -752,6 +762,43 @@ void WebApplication::sessionStart()
+     setHeader({Http::HEADER_SET_COOKIE, QString::fromLatin1(cookie.toRawForm())});
+ }
+ 
++// A new session is provisional until a request carries its cookie. Clients that do not keep cookies get a new
++// session with every request (under the authentication bypass), and each one held its API state (a full
++// sync/maindata snapshot after one call) for the whole session timeout. The session caps bound what clients
++// that do keep cookies can hold; provisional sessions are evicted first, then the least recently used.
++qint64 WebApplication::sessionTimeout(const WebSession *session) const
++{
++    if (session->isConfirmed())
++        return m_sessionTimeout;
++    return (m_sessionTimeout > 0)
++            ? std::min<qint64>(m_sessionTimeout, m_provisionalSessionTimeout) : m_provisionalSessionTimeout;
++}
++
++// removes the provisional session idle longest among those matching, or else the matching session idle longest
++void WebApplication::evictSession(const std::function<bool (const WebSession *)> &match)
++{
++    WebSession *victim = nullptr;
++    for (WebSession *session : asConst(m_sessions))
++    {
++        if (!match(session))
++            continue;
++        if (!victim || (std::make_pair(!session->isConfirmed(), session->idleTime())
++                > std::make_pair(!victim->isConfirmed(), victim->idleTime())))
++        {
++            victim = session;
++        }
++    }
++
++    Q_ASSERT(victim);
++    if (!victim) [[unlikely]]
++        return;
++
++    qDebug() << Q_FUNC_INFO << "evicting" << (victim->isConfirmed() ? "session" : "provisional session")
++             << "of" << victim->clientAddress().toString();
++    m_sessions.remove(victim->id());
++    delete victim;
++}
++
+ void WebApplication::sessionEnd()
+ {
+     Q_ASSERT(m_currentSession);
+@@ -906,9 +953,10 @@ QHostAddress WebApplication::resolveClientAddress() const
+ 
+ // WebSession
+ 
+-WebSession::WebSession(const QString &sid, IApplication *app)
++WebSession::WebSession(const QString &sid, const QHostAddress &clientAddress, IApplication *app)
+     : ApplicationComponent(app)
+     , m_sid {sid}
++    , m_clientAddress {clientAddress}
+ {
+     updateTimestamp();
+ }
+@@ -918,6 +966,26 @@ QString WebSession::id() const
+     return m_sid;
+ }
+ 
++QHostAddress WebSession::clientAddress() const
++{
++    return m_clientAddress;
++}
++
++qint64 WebSession::idleTime() const
++{
++    return m_timer.elapsed();
++}
++
++bool WebSession::isConfirmed() const
++{
++    return m_isConfirmed;
++}
++
++void WebSession::confirm()
++{
++    m_isConfirmed = true;
++}
++
+ bool WebSession::hasExpired(const qint64 seconds) const
+ {
+     if (seconds <= 0)
+diff --git a/src/webui/webapplication.h b/src/webui/webapplication.h
+index e30d5f3..6c0ed09 100644
+--- a/src/webui/webapplication.h
++++ b/src/webui/webapplication.h
+@@ -29,6 +29,8 @@
+ 
+ #pragma once
+ 
++#include <functional>
++
+ #include <type_traits>
+ #include <utility>
+ 
+@@ -71,19 +73,27 @@ namespace BitTorrent
+ class WebSession final : public ApplicationComponent<QObject>, public ISession
+ {
+ public:
+-    explicit WebSession(const QString &sid, IApplication *app);
++    WebSession(const QString &sid, const QHostAddress &clientAddress, IApplication *app);
+ 
+     QString id() const override;
++    QHostAddress clientAddress() const;
+ 
+     bool hasExpired(qint64 seconds) const;
+     void updateTimestamp();
++    qint64 idleTime() const;
++
++    // a request carried this session's cookie, i.e. the client keeps it
++    bool isConfirmed() const;
++    void confirm();
+ 
+     void registerAPIController(const QString &scope, APIController *controller);
+     APIController *getAPIController(const QString &scope) const;
+ 
+ private:
+     const QString m_sid;
++    const QHostAddress m_clientAddress;
+     QElapsedTimer m_timer;  // timestamp
++    bool m_isConfirmed = false;
+     QMap<QString, APIController *> m_apiControllers;
+ };
+ 
+@@ -125,6 +135,8 @@ private:
+     // Session management
+     QString generateSid() const;
+     void sessionInitialize();
++    qint64 sessionTimeout(const WebSession *session) const;
++    void evictSession(const std::function<bool (const WebSession *)> &match);
+     bool isAuthNeeded();
+     bool isPublicAPI(const QString &scope, const QString &action) const;
+ 
+@@ -243,6 +255,9 @@ private:
+     bool m_isAuthSubnetWhitelistEnabled = false;
+     QList<Utils::Net::Subnet> m_authSubnetWhitelist;
+     int m_sessionTimeout = 0;
++    int m_provisionalSessionTimeout = 60;
++    int m_maxSessionsPerClient = 8;
++    int m_maxSessions = 32;
+     QString m_sessionCookieName;
+ 
+     // security related
+diff --git a/src/webui/www/private/views/preferences.html b/src/webui/www/private/views/preferences.html
+index fa3f9c4..dc6799b 100644
+--- a/src/webui/www/private/views/preferences.html
++++ b/src/webui/www/private/views/preferences.html
+@@ -1006,6 +1006,18 @@
+                         <td><label for="webUISessionTimeoutInput">QBT_TR(Session timeout:)QBT_TR[CONTEXT=OptionsDialog]</label></td>
+                         <td><input type="number" id="webUISessionTimeoutInput" style="width: 6em;" min="0">&nbsp;&nbsp;QBT_TR(seconds)QBT_TR[CONTEXT=OptionsDialog]</td>
+                     </tr>
++                    <tr>
++                        <td><label for="webUIProvisionalSessionTimeoutInput">QBT_TR(Timeout of sessions whose cookie was not sent back yet:)QBT_TR[CONTEXT=OptionsDialog]</label></td>
++                        <td><input type="number" id="webUIProvisionalSessionTimeoutInput" style="width: 6em;" min="1">&nbsp;&nbsp;QBT_TR(seconds)QBT_TR[CONTEXT=OptionsDialog]</td>
++                    </tr>
++                    <tr>
++                        <td><label for="webUIMaxSessionsPerClientInput">QBT_TR(Max sessions per client address:)QBT_TR[CONTEXT=OptionsDialog]</label></td>
++                        <td><input type="number" id="webUIMaxSessionsPerClientInput" style="width: 6em;" min="1"></td>
++                    </tr>
++                    <tr>
++                        <td><label for="webUIMaxSessionsInput">QBT_TR(Max sessions:)QBT_TR[CONTEXT=OptionsDialog]</label></td>
++                        <td><input type="number" id="webUIMaxSessionsInput" style="width: 6em;" min="1"></td>
++                    </tr>
+                 </tbody>
+             </table>
+         </fieldset>
+@@ -2611,6 +2623,9 @@ Use ';' to split multiple entries. Can use wildcard '*'.)QBT_TR[CONTEXT=OptionsD
+                     $("webUIMaxAuthFailCountInput").value = Number(pref.web_ui_max_auth_fail_count);
+                     $("webUIBanDurationInput").value = Number(pref.web_ui_ban_duration);
+                     $("webUISessionTimeoutInput").value = Number(pref.web_ui_session_timeout);
++                    $("webUIProvisionalSessionTimeoutInput").value = Number(pref.web_ui_provisional_session_timeout);
++                    $("webUIMaxSessionsPerClientInput").value = Number(pref.web_ui_max_sessions_per_client);
++                    $("webUIMaxSessionsInput").value = Number(pref.web_ui_max_sessions);
+ 
+                     // Use alternative WebUI
+                     $("use_alt_webui_checkbox").checked = pref.alternative_webui_enabled;
+@@ -3091,6 +3106,9 @@ Use ';' to split multiple entries. Can use wildcard '*'.)QBT_TR[CONTEXT=OptionsD
+             settings["web_ui_max_auth_fail_count"] = Number($("webUIMaxAuthFailCountInput").value);
+             settings["web_ui_ban_duration"] = Number($("webUIBanDurationInput").value);
+             settings["web_ui_session_timeout"] = Number($("webUISessionTimeoutInput").value);
++            settings["web_ui_provisional_session_timeout"] = Number($("webUIProvisionalSessionTimeoutInput").value);
++            settings["web_ui_max_sessions_per_client"] = Number($("webUIMaxSessionsPerClientInput").value);
++            settings["web_ui_max_sessions"] = Number($("webUIMaxSessionsInput").value);
+ 
+             // Use alternative WebUI
+             const alternative_webui_enabled = $("use_alt_webui_checkbox").checked;
+-- 
+2.47.3
+

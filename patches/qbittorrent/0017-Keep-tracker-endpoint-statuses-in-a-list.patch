@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anonymous <anonymous@localhost>
+Date: Fri, 09 Oct 2026 01:13:56 +0000
+Subject: [PATCH 17/20] Keep tracker endpoint statuses in a list
+
+TrackerEntryStatus::endpoints was a QHash keyed by (name, btVersion), both of
+which the value already holds. A tracker has one or two endpoints, but Qt 6
+allocates room for 48 entries on a QHash's first insert, so every tracker of
+every torrent carried ~6 KiB (~48 MB at 8,900 single-tracker torrents).
+---
+ src/base/bittorrent/torrentimpl.cpp      | 13 ++++++++++---
+ src/base/bittorrent/trackerentrystatus.h |  5 ++++-
+ src/gui/trackerlist/trackerlistmodel.cpp |  5 +++--
+ 3 files changed, 17 insertions(+), 6 deletions(-)
+
+diff --git a/src/base/bittorrent/torrentimpl.cpp b/src/base/bittorrent/torrentimpl.cpp
+index 96547fe..8cebddf 100644
+--- a/src/base/bittorrent/torrentimpl.cpp
++++ b/src/base/bittorrent/torrentimpl.cpp
+@@ -136,7 +136,14 @@ namespace
+                 const lt::announce_endpoint &ltAnnounceInfo = ltAnnounceEndpoint;
+ #endif
+                 const QMap<int, int> &endpointUpdateInfo = updateInfo[ltAnnounceEndpoint.local_endpoint];
+-                TrackerEndpointStatus &trackerEndpointStatus = trackerEntryStatus.endpoints[std::make_pair(endpointName, protocolVersion)];
++                auto endpointIter = std::find_if(trackerEntryStatus.endpoints.begin(), trackerEntryStatus.endpoints.end()
++                        , [&endpointName, protocolVersion](const TrackerEndpointStatus &endpoint)
++                {
++                    return (endpoint.btVersion == protocolVersion) && (endpoint.name == endpointName);
++                });
++                if (endpointIter == trackerEntryStatus.endpoints.end())
++                    endpointIter = trackerEntryStatus.endpoints.emplace(trackerEntryStatus.endpoints.size());
++                TrackerEndpointStatus &trackerEndpointStatus = *endpointIter;
+ 
+                 trackerEndpointStatus.name = endpointName;
+                 trackerEndpointStatus.btVersion = protocolVersion;
+@@ -198,10 +205,10 @@ namespace
+         if (trackerEntryStatus.endpoints.size() > numEndpoints)
+         {
+             // remove outdated endpoints
+-            trackerEntryStatus.endpoints.removeIf([&nativeEntry](const QHash<std::pair<QString, int>, TrackerEndpointStatus>::iterator &iter)
++            trackerEntryStatus.endpoints.removeIf([&nativeEntry](const TrackerEndpointStatus &endpoint)
+             {
+                 return std::none_of(nativeEntry.endpoints.cbegin(), nativeEntry.endpoints.cend()
+-                        , [&endpointName = std::get<0>(iter.key())](const auto &existingEndpoint)
++                        , [&endpointName = endpoint.name](const auto &existingEndpoint)
+                 {
+                     return (endpointName == toString(existingEndpoint.local_endpoint));
+                 });
+diff --git a/src/base/bittorrent/trackerentrystatus.h b/src/base/bittorrent/trackerentrystatus.h
+index fa5998a..e23d81c 100644
+--- a/src/base/bittorrent/trackerentrystatus.h
++++ b/src/base/bittorrent/trackerentrystatus.h
+@@ -29,6 +29,7 @@
+ #pragma once
+ 
+ #include <QHash>
++#include <QList>
+ #include <QString>
+ 
+ #include "announcetimepoint.h"
+@@ -80,7 +81,9 @@ namespace BitTorrent
+         AnnounceTimePoint nextAnnounceTime {};
+         AnnounceTimePoint minAnnounceTime {};
+ 
+-        QHash<std::pair<QString, int>, TrackerEndpointStatus> endpoints {};
++        // A list rather than a QHash keyed by (name, btVersion): there are only one or two endpoints per
++        // tracker, and Qt 6 allocates room for 48 entries on a QHash's first insert (~6 KiB per tracker).
++        QList<TrackerEndpointStatus> endpoints {};
+ 
+         void clear();
+     };
+diff --git a/src/gui/trackerlist/trackerlistmodel.cpp b/src/gui/trackerlist/trackerlistmodel.cpp
+index 7846548..23c5f41 100644
+--- a/src/gui/trackerlist/trackerlistmodel.cpp
++++ b/src/gui/trackerlist/trackerlistmodel.cpp
+@@ -379,7 +379,7 @@ void TrackerListModel::populate()
+ std::shared_ptr<TrackerListModel::Item> TrackerListModel::createTrackerItem(const BitTorrent::TrackerEntryStatus &trackerEntryStatus)
+ {
+     const auto item = std::make_shared<Item>(trackerEntryStatus);
+-    for (const auto &[id, endpointStatus] : trackerEntryStatus.endpoints.asKeyValueRange())
++    for (const BitTorrent::TrackerEndpointStatus &endpointStatus : trackerEntryStatus.endpoints)
+         item->childItems.emplace_back(std::make_shared<Item>(item, endpointStatus));
+ 
+     return item;
+@@ -395,8 +395,9 @@ void TrackerListModel::updateTrackerItem(const std::shared_ptr<Item> &item, cons
+ {
+     QSet<std::pair<QString, int>> endpointItemIDs;
+     QList<std::shared_ptr<Item>> newEndpointItems;
+-    for (const auto &[id, endpointStatus] : trackerEntryStatus.endpoints.asKeyValueRange())
++    for (const BitTorrent::TrackerEndpointStatus &endpointStatus : trackerEntryStatus.endpoints)
+     {
++        const std::pair<QString, int> id {endpointStatus.name, endpointStatus.btVersion};
+         endpointItemIDs.insert(id);
+ 
+         auto &itemsByID = item->childItems.get<ByID>();
+-- 
+2.47.3
+

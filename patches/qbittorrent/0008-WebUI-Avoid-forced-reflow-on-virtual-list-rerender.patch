@@ -1,0 +1,114 @@
+From c8939d94aecce3c9ebb0f9183a5b79be8a5d1b7b Mon Sep 17 00:00:00 2001
+From: tehcneko <chsqwyx@gmail.com>
+Date: Sun, 22 Jun 2025 14:27:16 +0800
+Subject: [PATCH 08/12] WebUI: Avoid forced reflow on virtual list rerender
+
+Avoid forced synchronous layout caused by offsetHeight/scrollTop access.
+
+PR #22858.
+
+(cherry picked from commit d702a02c1fea12f79296768253a79e5db5cf31f6)
+
+Backport to 5.1.4: MooTools Class method syntax.
+---
+ src/webui/www/private/scripts/dynamicTable.js | 41 ++++++++-----------
+ 1 file changed, 16 insertions(+), 25 deletions(-)
+
+diff --git a/src/webui/www/private/scripts/dynamicTable.js b/src/webui/www/private/scripts/dynamicTable.js
+index 2621dab37..f95a9926d 100644
+--- a/src/webui/www/private/scripts/dynamicTable.js
++++ b/src/webui/www/private/scripts/dynamicTable.js
+@@ -102,6 +102,7 @@ window.qBittorrent.DynamicTable ??= (() => {
+                 return;
+             this.table.style.position = "relative";
+ 
++            this.renderedOffset = this.dynamicTableDiv.scrollTop;
+             this.renderedHeight = this.dynamicTableDiv.offsetHeight;
+             const resizeCallback = window.qBittorrent.Misc.createDebounceHandler(100, () => {
+                 const height = this.dynamicTableDiv.offsetHeight;
+@@ -120,8 +121,10 @@ window.qBittorrent.DynamicTable ??= (() => {
+             this.dynamicTableDiv.addEventListener("scroll", (e) => {
+                 tableElement.style.left = `${-this.dynamicTableDiv.scrollLeft}px`;
+                 // rerender on scroll
+-                if (this.useVirtualList)
++                if (this.useVirtualList) {
++                    this.renderedOffset = this.dynamicTableDiv.scrollTop;
+                     this.rerender();
++                }
+             });
+ 
+             this.dynamicTableDiv.addEventListener("click", (e) => {
+@@ -908,17 +911,20 @@ window.qBittorrent.DynamicTable ??= (() => {
+ 
+         rerender: function(rows = this.getFilteredAndSortedRows()) {
+             // set the scrollable height
+-            this.table.style.height = `${rows.length * this.rowHeight}px`;
++            const tableHeight = rows.length * this.rowHeight;
++            if (tableHeight !== this.previousTableHeight) {
++                this.previousTableHeight = tableHeight;
++                this.table.style.height = `${tableHeight}px`;
++            }
+ 
+-            if (this.dynamicTableDiv.offsetHeight === 0)
++            if (this.renderedHeight === 0)
+                 return;
+-            this.renderedHeight = this.dynamicTableDiv.offsetHeight;
+             // show extra rows at top/bottom to reduce flickering
+             const extraRowCount = 20;
+             // how many rows can be shown in the visible area
+             const visibleRowCount = Math.ceil(this.renderedHeight / this.rowHeight) + (extraRowCount * 2);
+-            // start position of visible rows, offsetted by scrollTop
+-            let startRow = Math.max((Math.trunc(this.dynamicTableDiv.scrollTop / this.rowHeight) - extraRowCount), 0);
++            // start position of visible rows, offsetted by renderedOffset
++            let startRow = Math.max((Math.trunc(this.renderedOffset / this.rowHeight) - extraRowCount), 0);
+             // ensure startRow is even
+             if ((startRow % 2) === 1)
+                 startRow = Math.max(0, startRow - 1);
+@@ -947,24 +953,6 @@ window.qBittorrent.DynamicTable ??= (() => {
+             // update visible rows
+             for (const row of this.tableBody.children)
+                 this.updateRow(row, true);
+-
+-            // refresh row height based on first row
+-            const tr = this.tableBody.firstChild;
+-            if (tr !== null) {
+-                const updateRowHeight = () => {
+-                    if (tr.offsetHeight === 0)
+-                        return;
+-                    if (this.rowHeight !== tr.offsetHeight) {
+-                        this.rowHeight = tr.offsetHeight;
+-                        // rerender on row height change
+-                        this.rerender();
+-                    }
+-                };
+-                if (tr.offsetHeight === 0)
+-                    setTimeout(updateRowHeight);
+-                else
+-                    updateRowHeight();
+-            }
+         },
+ 
+         createRowElement: function(row, top = -1) {
+@@ -996,6 +984,7 @@ window.qBittorrent.DynamicTable ??= (() => {
+             if (this.useVirtualList) {
+                 tr.style.position = "absolute";
+                 tr.style.top = `${top}px`;
++                tr.style.height = `${this.rowHeight}px`;
+             }
+         },
+ 
+@@ -2579,8 +2568,10 @@ window.qBittorrent.DynamicTable ??= (() => {
+             this.dynamicTableDiv.addEventListener("scroll", (e) => {
+                 headerDiv.scrollLeft = this.dynamicTableDiv.scrollLeft;
+                 // rerender on scroll
+-                if (this.useVirtualList)
++                if (this.useVirtualList) {
++                    this.renderedOffset = this.dynamicTableDiv.scrollTop;
+                     this.rerender();
++                }
+             });
+         }
+     });
+-- 
+2.47.3
+

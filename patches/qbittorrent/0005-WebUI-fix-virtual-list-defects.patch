@@ -1,0 +1,95 @@
+From a7cc36be14cb5d9f357ede49b573d0632c88fac1 Mon Sep 17 00:00:00 2001
+From: tehcneko <chsqwyx@gmail.com>
+Date: Tue, 29 Apr 2025 20:16:00 +0800
+Subject: [PATCH 05/12] WebUI: fix virtual list defects
+
+Fixes https://github.com/qbittorrent/qBittorrent/pull/22502#issuecomment-2822201721 and https://github.com/qbittorrent/qBittorrent/pull/22502#issuecomment-2822253388.
+
+PR #22597.
+
+(cherry picked from commit 0791828b84c150ce11170ea88f848fc77658cd06)
+---
+ src/webui/www/private/scripts/dynamicTable.js | 46 +++++++++++++------
+ 1 file changed, 32 insertions(+), 14 deletions(-)
+
+diff --git a/src/webui/www/private/scripts/dynamicTable.js b/src/webui/www/private/scripts/dynamicTable.js
+index 33131ee6f..2b19f781e 100644
+--- a/src/webui/www/private/scripts/dynamicTable.js
++++ b/src/webui/www/private/scripts/dynamicTable.js
+@@ -910,6 +910,9 @@ window.qBittorrent.DynamicTable ??= (() => {
+             // set the scrollable height
+             this.table.style.height = `${rows.length * this.rowHeight}px`;
+ 
++            if (this.dynamicTableDiv.offsetHeight === 0)
++                return;
++            this.renderedHeight = this.dynamicTableDiv.offsetHeight;
+             // show extra 6 rows at top/bottom to reduce flickering
+             const extraRowCount = 6;
+             // how many rows can be shown in the visible area
+@@ -946,17 +949,22 @@ window.qBittorrent.DynamicTable ??= (() => {
+                 this.updateRow(row, true);
+ 
+             // refresh row height based on first row
+-            setTimeout(() => {
+-                if (this.tableBody.firstChild === null)
+-                    return;
+-                const tr = this.tableBody.firstChild;
+-                if (this.rowHeight !== tr.offsetHeight) {
+-                    this.rowHeight = tr.offsetHeight;
+-                    // rerender on row height change
+-                    this.rerender();
+-                }
+-
+-            });
++            const tr = this.tableBody.firstChild;
++            if (tr !== null) {
++                const updateRowHeight = () => {
++                    if (tr.offsetHeight === 0)
++                        return;
++                    if (this.rowHeight !== tr.offsetHeight) {
++                        this.rowHeight = tr.offsetHeight;
++                        // rerender on row height change
++                        this.rerender();
++                    }
++                };
++                if (tr.offsetHeight === 0)
++                    setTimeout(updateRowHeight);
++                else
++                    updateRowHeight();
++            }
+         },
+ 
+         createRowElement: function(row, top = -1) {
+@@ -2654,8 +2662,18 @@ window.qBittorrent.DynamicTable ??= (() => {
+ 
+             this._updateNodeCollapseIcon(node, shouldCollapse);
+ 
+-            for (const child of node.children)
+-                this._updateNodeVisibility(child, shouldCollapse);
++            this._updateNodeChildVisibility(node, shouldCollapse);
++        },
++
++        _updateNodeChildVisibility: function(root, shouldHide) {
++            const stack = [...root.children];
++            while (stack.length > 0) {
++                const node = stack.pop();
++
++                this._updateNodeVisibility(node, (shouldHide ? shouldHide : this.isCollapsed(node.root.rowId)));
++
++                stack.push(...node.children);
++            }
+         },
+ 
+         clear: function() {
+@@ -2919,7 +2937,7 @@ window.qBittorrent.DynamicTable ??= (() => {
+ 
+         _filterNodes: function(node, filterTerms, filteredRows) {
+             if (node.isFolder && (!this.useVirtualList || !this.isCollapsed(node.rowId))) {
+-                const childAdded = node.children.reduce((acc, child) => {
++                const childAdded = node.children.toReversed().reduce((acc, child) => {
+                     // we must execute the function before ORing w/ acc or we'll stop checking child nodes after the first successful match
+                     return (this._filterNodes(child, filterTerms, filteredRows) || acc);
+                 }, false);
+-- 
+2.47.3
+

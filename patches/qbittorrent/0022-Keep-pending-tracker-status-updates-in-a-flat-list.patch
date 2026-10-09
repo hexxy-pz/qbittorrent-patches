@@ -1,0 +1,117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anonymous <anonymous@localhost>
+Date: Fri, 09 Oct 2026 04:06:17 +0000
+Subject: [PATCH 22/22] Keep pending tracker status updates in a flat list
+
+Tracker alerts collect, per torrent, the trackers and endpoints to refresh and
+the peer counts they reported, until the torrent's tracker statuses are
+updated. They were kept as QHash<url, QHash<endpoint, QMap<version, peers>>>:
+one or two entries, but Qt 6 allocates room for 48 on a QHash's first insert,
+so a waiting torrent cost several KiB. While thousands wait (an announce wave,
+startup, trackers failing) that held about 29 MB here. A flat list per torrent
+holds the same; the nested form is built only for the update itself.
+---
+ src/base/bittorrent/sessionimpl.cpp | 35 ++++++++++++++++++++++++-----
+ src/base/bittorrent/sessionimpl.h   | 15 ++++++++++---
+ 2 files changed, 41 insertions(+), 9 deletions(-)
+
+diff --git a/src/base/bittorrent/sessionimpl.cpp b/src/base/bittorrent/sessionimpl.cpp
+index 9e227c5..13762ca 100644
+--- a/src/base/bittorrent/sessionimpl.cpp
++++ b/src/base/bittorrent/sessionimpl.cpp
+@@ -34,6 +34,7 @@
+ #include <ctime>
+ #include <queue>
+ #include <string>
++#include <string_view>
+ 
+ #ifdef Q_OS_WIN
+ #include <windows.h>
+@@ -6688,20 +6689,33 @@ void SessionImpl::handleTrackerAlert(const lt::tracker_alert *alert)
+     [[maybe_unused]] const QMutexLocker updatedTrackerStatusesLocker {&m_updatedTrackerStatusesMutex};
+ 
+     const auto prevSize = m_updatedTrackerStatuses.size();
+-    QMap<int, int> &updateInfo = m_updatedTrackerStatuses[torrent->nativeHandle()][std::string(alert->tracker_url())][alert->local_endpoint];
++    std::vector<UpdatedTrackerStatus> &updates = m_updatedTrackerStatuses[torrent->nativeHandle()];
+     if (prevSize < m_updatedTrackerStatuses.size())
+         updateTrackerEntryStatuses(torrent->nativeHandle());
+ 
++    int protocolVersionNum = 0;
++    int numPeers = -1;
+     if (alert->type() == lt::tracker_reply_alert::alert_type)
+     {
+-        const int numPeers = static_cast<const lt::tracker_reply_alert *>(alert)->num_peers;
++        numPeers = static_cast<const lt::tracker_reply_alert *>(alert)->num_peers;
+ #ifdef QBT_USES_LIBTORRENT2
+-        const int protocolVersionNum = (static_cast<const lt::tracker_reply_alert *>(alert)->version == lt::protocol_version::V1) ? 1 : 2;
++        protocolVersionNum = (static_cast<const lt::tracker_reply_alert *>(alert)->version == lt::protocol_version::V1) ? 1 : 2;
+ #else
+-        const int protocolVersionNum = 1;
++        protocolVersionNum = 1;
+ #endif
+-        updateInfo.insert(protocolVersionNum, numPeers);
+     }
++
++    // one entry per tracker, endpoint and protocol version; the latest response wins
++    const std::string_view url = alert->tracker_url();
++    const auto iter = std::find_if(updates.begin(), updates.end(), [&](const UpdatedTrackerStatus &update)
++    {
++        return (update.protocolVersion == protocolVersionNum) && (update.endpoint == alert->local_endpoint)
++                && (update.url == url);
++    });
++    if (iter == updates.end())
++        updates.push_back({std::string(url), alert->local_endpoint, protocolVersionNum, numPeers});
++    else
++        iter->numPeers = numPeers;
+ }
+ 
+ #ifdef QBT_USES_LIBTORRENT2
+@@ -6785,9 +6799,18 @@ void SessionImpl::updateTrackerEntryStatuses(lt::torrent_handle torrentHandle)
+             std::vector<lt::announce_entry> nativeTrackers = torrentHandle.trackers();
+ 
+             QMutexLocker updatedTrackerStatusesLocker {&m_updatedTrackerStatusesMutex};
+-            QHash<std::string, QHash<lt::tcp::endpoint, QMap<int, int>>> updatedTrackers = m_updatedTrackerStatuses.take(torrentHandle);
++            const std::vector<UpdatedTrackerStatus> updates = m_updatedTrackerStatuses.take(torrentHandle);
+             updatedTrackerStatusesLocker.unlock();
+ 
++            // (tracker URL -> local endpoint -> protocol version -> amount of peers) for this update only
++            QHash<std::string, QHash<lt::tcp::endpoint, QMap<int, int>>> updatedTrackers;
++            for (const UpdatedTrackerStatus &update : updates)
++            {
++                QMap<int, int> &updateInfo = updatedTrackers[update.url][update.endpoint];
++                if (update.protocolVersion > 0)
++                    updateInfo.insert(update.protocolVersion, update.numPeers);
++            }
++
+             invoke([this, infoHash = torrentHandle.info_hash(), nativeTrackers = std::move(nativeTrackers), updatedTrackers = std::move(updatedTrackers)]
+             {
+                 TorrentImpl *torrent = m_torrents.value(infoHash);
+diff --git a/src/base/bittorrent/sessionimpl.h b/src/base/bittorrent/sessionimpl.h
+index 769fa82..44a1193 100644
+--- a/src/base/bittorrent/sessionimpl.h
++++ b/src/base/bittorrent/sessionimpl.h
+@@ -863,9 +863,18 @@ namespace BitTorrent
+         qsizetype m_receivedAddTorrentAlertsCount = 0;
+         QList<Torrent *> m_loadedTorrents;
+ 
+-        // This field holds amounts of peers reported by trackers in their responses to announces
+-        // (torrent.tracker_name.tracker_local_endpoint.protocol_version.num_peers)
+-        QHash<lt::torrent_handle, QHash<std::string, QHash<lt::tcp::endpoint, QMap<int, int>>>> m_updatedTrackerStatuses;
++        // Trackers (and their endpoints) of each torrent that sent alerts since its statuses were last updated,
++        // with the amounts of peers they reported in their responses to announces. A flat list: these are one
++        // or two entries per torrent, and nested QHashes (48 entries allocated on the first insert) cost
++        // several KiB per torrent while thousands of them wait to be processed.
++        struct UpdatedTrackerStatus
++        {
++            std::string url;
++            lt::tcp::endpoint endpoint;
++            int protocolVersion = 0;  // 0: no announce response
++            int numPeers = -1;
++        };
++        QHash<lt::torrent_handle, std::vector<UpdatedTrackerStatus>> m_updatedTrackerStatuses;
+         QMutex m_updatedTrackerStatusesMutex;
+ 
+         // I/O errored torrents
+-- 
+2.47.3
+
