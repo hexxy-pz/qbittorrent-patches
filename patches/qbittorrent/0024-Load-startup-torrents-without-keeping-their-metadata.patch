@@ -1,0 +1,109 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anonymous <anonymous@localhost>
+Date: Fri, 09 Oct 2026 16:47:01 +0000
+Subject: [PATCH 24/25] Load startup torrents without keeping their metadata twice
+
+A startup with ~9,000 torrents (803 MB of piece hashes) peaked at 1.3-1.4 GB
+before settling under 300 MB, for two reasons:
+
+- The query reading all torrents from the database was not forward-only, so
+  Qt's SQLite result kept a copy of every row it had returned, all metadata
+  included, until the whole table was read.
+- The loader thread parses torrents much faster than the session hands them
+  to libtorrent, and their piece hashes were only moved out of memory when
+  the session took them from that queue.
+
+Make the query forward-only, and when piece hashes are loaded on demand, do
+that in the loader thread right after parsing each torrent.
+---
+ src/base/bittorrent/dbresumedatastorage.cpp | 9 +++++++++
+ src/base/bittorrent/dbresumedatastorage.h   | 4 ++++
+ src/base/bittorrent/sessionimpl.cpp         | 3 ++-
+ src/base/bittorrent/sessionimpl.h           | 2 +-
+ 4 files changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/src/base/bittorrent/dbresumedatastorage.cpp b/src/base/bittorrent/dbresumedatastorage.cpp
+index a8fa0aa..04b9b3f 100644
+--- a/src/base/bittorrent/dbresumedatastorage.cpp
++++ b/src/base/bittorrent/dbresumedatastorage.cpp
+@@ -405,6 +405,11 @@ lt::info_section_loader BitTorrent::DBResumeDataStorage::infoSectionLoader() con
+     };
+ }
+ 
++void BitTorrent::DBResumeDataStorage::loadPieceHashesOnDemand(lt::info_section_loader loader)
++{
++    m_pieceHashesLoader = std::move(loader);
++}
++
+ QList<BitTorrent::TorrentID> BitTorrent::DBResumeDataStorage::registeredTorrents() const
+ {
+     const auto selectTorrentIDStatement = u"SELECT %1 FROM %2 ORDER BY %3;"_s
+@@ -478,6 +483,8 @@ void BitTorrent::DBResumeDataStorage::doLoadAll() const
+             throw RuntimeError(db.lastError().text());
+ 
+         QSqlQuery query {db};
++        // otherwise a query keeps every row it has returned (all the metadata) until it is finished
++        query.setForwardOnly(true);
+ 
+         const auto selectTorrentIDStatement = u"SELECT %1 FROM %2 ORDER BY %3;"_s
+                 .arg(quoted(DB_COLUMN_TORRENT_ID.name), quoted(DB_TABLE_TORRENTS), quoted(DB_COLUMN_QUEUE_POSITION.name));
+@@ -808,6 +815,8 @@ LoadResumeDataResult DBResumeDataStorage::parseQueryResultRow(const QSqlQuery &q
+         if (ec)
+             return nonstd::make_unexpected(tr("Cannot parse torrent info: %1").arg(QString::fromStdString(ec.message())));
+         resumeData.metadataStored = true;
++        if (m_pieceHashesLoader)
++            p.ti->load_piece_hashes_on_demand(m_pieceHashesLoader, false);
+     }
+ 
+     p.save_path = Profile::instance()->fromPortablePath(Path(fromLTString(p.save_path)))
+diff --git a/src/base/bittorrent/dbresumedatastorage.h b/src/base/bittorrent/dbresumedatastorage.h
+index 3c1d36a..7544109 100644
+--- a/src/base/bittorrent/dbresumedatastorage.h
++++ b/src/base/bittorrent/dbresumedatastorage.h
+@@ -59,6 +59,9 @@ namespace BitTorrent
+ 
+         // reads a torrent's info section from the database, for lt::torrent_info::load_piece_hashes_on_demand()
+         lt::info_section_loader infoSectionLoader() const;
++        // Torrents loaded after this keep their piece hashes out of memory from the start, so a startup does not
++        // hold the hashes of every torrent while they wait to be added. Call it before loadAll().
++        void loadPieceHashesOnDemand(lt::info_section_loader loader);
+ 
+     private:
+         void doLoadAll() const override;
+@@ -74,6 +77,7 @@ namespace BitTorrent
+         class InfoSectionReader;
+         const Path m_dbPath;
+         mutable std::shared_ptr<InfoSectionReader> m_infoSectionReader;
++        lt::info_section_loader m_pieceHashesLoader;
+ 
+         mutable QReadWriteLock m_dbLock;
+     };
+diff --git a/src/base/bittorrent/sessionimpl.cpp b/src/base/bittorrent/sessionimpl.cpp
+index d07cbdb..42e30b0 100644
+--- a/src/base/bittorrent/sessionimpl.cpp
++++ b/src/base/bittorrent/sessionimpl.cpp
+@@ -5541,9 +5541,10 @@ void SessionImpl::setPieceHashesIdleTime(const int minutes)
+     m_pieceHashesIdleTime = std::max(1, minutes);
+ }
+ 
+-void SessionImpl::enablePieceHashesOnDemand(const DBResumeDataStorage *storage)
++void SessionImpl::enablePieceHashesOnDemand(DBResumeDataStorage *storage)
+ {
+     m_infoSectionLoader = storage->infoSectionLoader();
++    storage->loadPieceHashesOnDemand(m_infoSectionLoader);
+     connect(storage, &ResumeDataStorage::metadataStored, this, [this](const TorrentID &id)
+     {
+         if (TorrentImpl *torrent = m_torrents.value(id))
+diff --git a/src/base/bittorrent/sessionimpl.h b/src/base/bittorrent/sessionimpl.h
+index 7702e85..586abb1 100644
+--- a/src/base/bittorrent/sessionimpl.h
++++ b/src/base/bittorrent/sessionimpl.h
+@@ -579,7 +579,7 @@ namespace BitTorrent
+         void enableTracker(bool enable);
+         void enableBandwidthScheduler();
+         void populateAdditionalTrackers();
+-        void enablePieceHashesOnDemand(const DBResumeDataStorage *storage);
++        void enablePieceHashesOnDemand(DBResumeDataStorage *storage);
+         void releaseUnusedPieceHashes();
+         void enableIPFilter();
+         void disableIPFilter();

@@ -23,8 +23,13 @@ toolchain, unless noted.
 | Redundant outgoing connections from seeds | up to 50 per second | 0 | opt-in setting | qBittorrent 0014 |
 | Idle memory (~8,900 torrents) | 1,550 MB | 340 MB | **4.6× less** | libtorrent 0003, qBittorrent 0017-0019 |
 | Idle memory, long-running instance | 2.0 GB | 465 MB | **4.3× less** | libtorrent 0003-0004, qBittorrent 0017-0022 |
+| Memory peak during startup (~8,900 torrents) ¹ | 1,160 MB | 277 MB | **4.2× less**, no spike above idle | qBittorrent 0023-0024 |
+| Memory added by one open WebUI session ¹ | ~90 MB | ~24 MB | **3.8× less** | qBittorrent 0025 |
+| Repeated full WebUI refresh (`sync/maindata`) ¹ | 430 ms | 200 ms | **2.2× faster** | qBittorrent 0025 |
 | Memory allocator: musl → Scudo | ~335 MB | ~300 MB | **10 % less memory**, same speed, strongest heap hardening | Dockerfile |
 | WebUI sessions from clients without cookies | unlimited, 85-120 MB each | at most 32 | memory capped | qBittorrent 0020 |
+
+¹ Compared with the build with patches 0001-0022 rather than stock.
 
 Every new behaviour has a setting in the WebUI (Options), the WebAPI preferences and `qBittorrent.conf`.
 
@@ -205,7 +210,7 @@ Idle memory, ~8,900 torrents all seeding, 2 minutes after start:
 ### 0020: WebUI session limits
 Under the authentication bypass (localhost or a whitelisted subnet), every request without a session cookie
 started a new WebUI session kept for the whole session timeout, and one that called `sync/maindata` held a
-full snapshot (85-120 MB at ~8,000 torrents). A client polling without cookies could exhaust memory.
+full snapshot (85-120 MB at ~8,000 torrents; about 24 MB since 0025). A client polling without cookies could exhaust memory.
 
 | | Before | After |
 |---|---|---|
@@ -221,6 +226,52 @@ URL seeds for one constructor call, then kept it until the torrent was removed. 
 Tracker alerts queue per-torrent updates (trackers, endpoints, peer counts) until the tracker statuses are
 refreshed. They were two levels of nested `QHash`es, each allocating 48 entries on first insert, about 3 KB per
 waiting torrent: 29 MB while announces were failing. Now a flat list per torrent.
+
+### 0023: release startup loading buffers
+Two containers that every torrent passes through at startup kept their peak size for the rest of the session:
+the table of torrents waiting for libtorrent's add alert (a `QHash` keeps the storage of erased entries, about
+1 KiB per torrent) and the list the database loader thread fills (clearing a shared `QList` allocates a new one
+of the same capacity). Both give their storage back once drained. The saving is small, 2-4 MB: the allocator
+keeps most of the freed buffers for reuse instead of returning them to the system.
+
+### 0024: no metadata copies during startup
+Startup peaked far above steady state, for two reasons:
+
+- The query reading all torrents from the database was not forward-only, so Qt's SQLite driver kept a copy of
+  every row it had returned, all metadata included, until the whole table was read.
+- The loader thread parses torrents much faster than the session adds them to libtorrent, and the queued
+  torrents still held their piece hashes.
+
+The query is forward-only now, and with piece hashes on demand (0019) the loader thread drops them right after
+parsing. The forward-only query does most of the work: dropping the hashes alone only brought the peak down to
+1,034 MB.
+
+### 0025: field hashes instead of torrent copies for `sync/maindata`
+To send only what changed, every WebUI session kept a copy of every torrent's fields (about 10 KiB per torrent)
+until the session expired. It now keeps a 64-bit hash of each field's JSON per torrent (about 0.5 KiB), and a
+full update the client has not confirmed yet no longer holds a second copy.
+
+Responses were compared field by field against stock: full updates, incremental updates after category, tag,
+stop, rename and delete changes, and full updates the client never confirmed. All match except one rare case:
+a client that resends an older accepted `rid` after a full update it never confirmed gets the changed torrents
+in full instead of only their changed fields. Both are valid for the client.
+
+### Benchmark for 0023-0025
+~8,900 torrents all seeding, Scudo, the three builds side by side, one `sync/maindata` request from a new
+session at minute 8. "Before" is the build with patches 0001-0022.
+
+| Build | Memory peak during startup | Idle memory | With one WebUI session open |
+|---|---|---|---|
+| patches 0001-0022 | 1,160 MB | 274 MB | 364 MB |
+| + 0023 + 0024 | **277 MB** | 273 MB | 363 MB |
+| + 0023 + 0024 + 0025 | 279 MB | 273 MB | **297 MB** |
+
+| | Before | After | Result |
+|---|---|---|---|
+| Memory peak during startup | 1,160 MB | 277 MB | 4.2× less, no spike above idle |
+| Memory added by one WebUI session | ~90 MB | ~24 MB | 3.8× less |
+| First full `sync/maindata` of a session | ~440 ms | ~440 ms | same |
+| Later full `sync/maindata` requests | 430 ms | 200 ms | 2.2× faster |
 
 ## Memory allocator
 qBittorrent on Alpine uses musl's allocator (mallocng). Each candidate was preloaded with `LD_PRELOAD` into the
@@ -296,3 +347,6 @@ libtorrent to Scudo, and the exporter reports the allocator in use (`qbittorrent
 | 0020 | WebUI: Expire unconfirmed sessions early and cap sessions |
 | 0021 | Free the torrent extension's initial data once it is used |
 | 0022 | Keep pending tracker status updates in a flat list |
+| 0023 | Release startup loading buffers once they are drained |
+| 0024 | Load startup torrents without keeping their metadata twice |
+| 0025 | WebAPI: Keep field hashes instead of torrent copies for sync/maindata |

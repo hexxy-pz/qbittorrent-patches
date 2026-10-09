@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anonymous <anonymous@localhost>
+Date: Fri, 09 Oct 2026 16:40:59 +0000
+Subject: [PATCH 23/23] Release startup loading buffers once they are drained
+
+Two containers that every torrent passes through at startup kept their peak
+size for the rest of the session:
+
+- m_loadingTorrents holds a torrent between being handed to libtorrent and
+  its add_torrent_alert. At startup that is thousands at once, and a QHash
+  keeps the storage of erased entries (about 1 KiB per LoadTorrentParams).
+  Squeeze it when the last loading torrent is gone.
+- ResumeDataStorage::fetchLoadedResumeData() copied the list of parsed
+  torrents and cleared it. Clearing a shared QList allocates a new, empty
+  buffer of the same capacity, so the storage held room for the largest
+  batch the loader thread got ahead by. Swap it out instead.
+---
+ src/base/bittorrent/resumedatastorage.cpp |  7 ++++---
+ src/base/bittorrent/sessionimpl.cpp       | 10 ++++++++++
+ src/base/bittorrent/sessionimpl.h         |  1 +
+ 3 files changed, 15 insertions(+), 3 deletions(-)
+
+diff --git a/src/base/bittorrent/resumedatastorage.cpp b/src/base/bittorrent/resumedatastorage.cpp
+index f21d3c8..eee4d7b 100644
+--- a/src/base/bittorrent/resumedatastorage.cpp
++++ b/src/base/bittorrent/resumedatastorage.cpp
+@@ -63,10 +63,11 @@ void BitTorrent::ResumeDataStorage::loadAll() const
+ 
+ QList<BitTorrent::LoadedResumeData> BitTorrent::ResumeDataStorage::fetchLoadedResumeData() const
+ {
++    // swapped rather than copied and cleared: clear() on the shared list would allocate a new buffer as large as
++    // the biggest batch so far, held for the lifetime of the storage
++    QList<BitTorrent::LoadedResumeData> loadedResumeData;
+     const QMutexLocker locker {&m_loadedResumeDataMutex};
+-
+-    const QList<BitTorrent::LoadedResumeData> loadedResumeData = m_loadedResumeData;
+-    m_loadedResumeData.clear();
++    loadedResumeData.swap(m_loadedResumeData);
+ 
+     return loadedResumeData;
+ }
+diff --git a/src/base/bittorrent/sessionimpl.cpp b/src/base/bittorrent/sessionimpl.cpp
+index 13762ca..d07cbdb 100644
+--- a/src/base/bittorrent/sessionimpl.cpp
++++ b/src/base/bittorrent/sessionimpl.cpp
+@@ -6024,6 +6024,7 @@ void SessionImpl::handleAddTorrentAlert(const lt::add_torrent_alert *alert)
+                     ? AddTorrentError::DuplicateTorrent : AddTorrentError::Other;
+             emit addTorrentFailed(infoHash, {errorKind, msg});
+             m_loadingTorrents.erase(loadingTorrentsIter);
++            releaseLoadingTorrentsStorage();
+         }
+         else if (const auto downloadedMetadataIter = m_downloadedMetadata.find(TorrentID::fromInfoHash(infoHash))
+                  ; downloadedMetadataIter != m_downloadedMetadata.end())
+@@ -6052,6 +6053,7 @@ void SessionImpl::handleAddTorrentAlert(const lt::add_torrent_alert *alert)
+     {
+         const LoadTorrentParams params = loadingTorrentsIter.value();
+         m_loadingTorrents.erase(loadingTorrentsIter);
++        releaseLoadingTorrentsStorage();
+ 
+         Torrent *torrent = createTorrent(alert->handle, params);
+         m_loadedTorrents.append(torrent);
+@@ -6069,6 +6071,14 @@ void SessionImpl::handleAddTorrentAlert(const lt::add_torrent_alert *alert)
+     }
+ }
+ 
++void SessionImpl::releaseLoadingTorrentsStorage()
++{
++    // QHash keeps the storage of erased entries. At startup every torrent passes through m_loadingTorrents at
++    // once (about 1 KiB each), so give it back when the last one has been loaded.
++    if (m_loadingTorrents.isEmpty())
++        m_loadingTorrents.squeeze();
++}
++
+ void SessionImpl::handleAlert(const lt::alert *alert)
+ {
+     try
+diff --git a/src/base/bittorrent/sessionimpl.h b/src/base/bittorrent/sessionimpl.h
+index 44a1193..7702e85 100644
+--- a/src/base/bittorrent/sessionimpl.h
++++ b/src/base/bittorrent/sessionimpl.h
+@@ -599,6 +599,7 @@ namespace BitTorrent
+         void handleAlert(const lt::alert *alert);
+         void dispatchTorrentAlert(const lt::torrent_alert *alert);
+         void handleAddTorrentAlert(const lt::add_torrent_alert *alert);
++        void releaseLoadingTorrentsStorage();
+         void handleStateUpdateAlert(const lt::state_update_alert *alert);
+         void handleMetadataReceivedAlert(const lt::metadata_received_alert *alert);
+         void handleFileErrorAlert(const lt::file_error_alert *alert);

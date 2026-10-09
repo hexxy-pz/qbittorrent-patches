@@ -1,0 +1,235 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Anonymous <anonymous@localhost>
+Date: Fri, 09 Oct 2026 16:51:30 +0000
+Subject: [PATCH 25/25] WebAPI: Keep field hashes instead of torrent copies for
+ sync/maindata
+
+To send only what changed, every sync/maindata session kept a copy of every
+torrent's fields as a QVariantMap (about 10 KiB per torrent with all its
+strings and map nodes): 90 MB per WebUI session with ~9,000 torrents, held
+until the session expires. A full update the client had not confirmed yet
+held another reference to it.
+
+A session now keeps, per torrent, a 64-bit hash of each field's JSON text
+(the key list is shared by all torrents with the same fields): about 0.5 KiB
+per torrent. A field is sent when its hash differs, or, if it is missing
+from the previous digest, when it is not null, as before. Full updates are
+written straight from the torrents; until the client confirms one, the
+session only notes that all torrents have to be sent again.
+---
+ src/webui/api/synccontroller.cpp | 101 ++++++++++++++++++++++++++-----
+ src/webui/api/synccontroller.h   |  19 ++++++
+ 2 files changed, 105 insertions(+), 15 deletions(-)
+
+diff --git a/src/webui/api/synccontroller.cpp b/src/webui/api/synccontroller.cpp
+index d8fe6be..78e01b4 100644
+--- a/src/webui/api/synccontroller.cpp
++++ b/src/webui/api/synccontroller.cpp
+@@ -173,6 +173,18 @@ namespace
+         return map;
+     }
+ 
++    quint64 jsonHash(const QByteArray &json)
++    {
++        return qHash(QByteArrayView(json), 0);
++    }
++
++    // a field missing from a torrent's digest counts as null, as processMap() treats it
++    quint64 nullValueHash()
++    {
++        static const quint64 hash = jsonHash(QByteArrayLiteral("null"));
++        return hash;
++    }
++
+     // Compare two structures (prevData, data) and calculate difference (syncData).
+     // Structures encoded as map.
+     QVariantMap processMap(const QVariantMap &prevData, const QVariantMap &data)
+@@ -518,20 +530,16 @@ void SyncController::makeMaindataSnapshot()
+     m_knownTrackers.clear();
+     m_maindataAcceptedID = 0;
+     m_maindataSnapshot = {};
++    m_torrentDigests.clear();
+ 
+     const auto *session = BitTorrent::Session::instance();
+ 
++    // the torrents themselves are digested by the full update that follows
+     for (const BitTorrent::Torrent *torrent : asConst(session->torrents()))
+     {
+         const BitTorrent::TorrentID torrentID = torrent->id();
+-
+-        QVariantMap serializedTorrent = serialize(*torrent);
+-        serializedTorrent.remove(KEY_TORRENT_ID);
+-
+         for (const BitTorrent::TrackerEntryStatus &status : asConst(torrent->trackers()))
+             m_knownTrackers[status.url].insert(torrentID);
+-
+-        m_maindataSnapshot.torrents[torrentID.toString()] = serializedTorrent;
+     }
+ 
+     const QStringList categoriesList = session->categories();
+@@ -636,20 +644,15 @@ QByteArray SyncController::generateMaindataSyncData(const int id, const bool ful
+         QVariantMap serializedTorrent = serialize(*torrent);
+         serializedTorrent.remove(KEY_TORRENT_ID);
+ 
+-        auto &torrentSnapshot = m_maindataSnapshot.torrents[torrentID.toString()];
+-
+-        if (const QVariantMap syncData = processMap(torrentSnapshot, serializedTorrent); !syncData.isEmpty())
+-        {
++        if (const QVariantMap syncData = processTorrent(torrentID, serializedTorrent); !syncData.isEmpty())
+             m_maindataSyncBuf.torrents[torrentID.toString()] = syncData;
+-            torrentSnapshot = serializedTorrent;
+-        }
+     }
+     m_updatedTorrents.clear();
+ 
+     for (const BitTorrent::TorrentID &torrentID : asConst(m_removedTorrents))
+     {
+         m_maindataSyncBuf.removedTorrents.append(torrentID.toString());
+-        m_maindataSnapshot.torrents.remove(torrentID.toString());
++        m_torrentDigests.remove(torrentID);
+     }
+     m_removedTorrents.clear();
+ 
+@@ -686,13 +689,14 @@ QByteArray SyncController::generateMaindataSyncData(const int id, const bool ful
+     }
+ 
+     QByteArray syncData;
+-    syncData.reserve(fullUpdate ? (m_maindataSyncBuf.torrents.size() * 2048) : 4096);
++    syncData.reserve((fullUpdate || m_maindataSyncBuf.allTorrents) ? (session->torrents().size() * 2048) : 4096);
+     {
+         JsonWriter::ObjectWriter syncObject {syncData};
+         JsonWriter::appendValue(syncObject.key(KEY_RESPONSE_ID), id);
+         if (fullUpdate)
+         {
+             m_maindataSyncBuf = m_maindataSnapshot;
++            m_maindataSyncBuf.allTorrents = true;
+             JsonWriter::appendValue(syncObject.key(KEY_FULL_UPDATE), true);
+         }
+ 
+@@ -706,8 +710,15 @@ QByteArray SyncController::generateMaindataSyncData(const int id, const bool ful
+         if (!m_maindataSyncBuf.removedTags.isEmpty())
+             JsonWriter::appendStringList(syncObject.key(KEY_TAGS_REMOVED), m_maindataSyncBuf.removedTags);
+ 
+-        if (!m_maindataSyncBuf.torrents.isEmpty())
++        if (m_maindataSyncBuf.allTorrents)
++        {
++            if (!session->torrents().isEmpty())
++                appendAllTorrents(syncObject.key(KEY_TORRENTS));
++        }
++        else if (!m_maindataSyncBuf.torrents.isEmpty())
++        {
+             JsonWriter::appendHash(syncObject.key(KEY_TORRENTS), m_maindataSyncBuf.torrents, &JsonWriter::appendMap);
++        }
+         if (!m_maindataSyncBuf.removedTorrents.isEmpty())
+             JsonWriter::appendStringList(syncObject.key(KEY_TORRENTS_REMOVED), m_maindataSyncBuf.removedTorrents);
+ 
+@@ -723,6 +734,66 @@ QByteArray SyncController::generateMaindataSyncData(const int id, const bool ful
+     return syncData;
+ }
+ 
++SyncController::TorrentDigest SyncController::makeTorrentDigest(const QVariantMap &serializedTorrent)
++{
++    TorrentDigest digest;
++    if (const QStringList keys = serializedTorrent.keys(); keys == m_torrentKeys)
++        digest.keys = m_torrentKeys;
++    else
++        digest.keys = m_torrentKeys = keys;
++
++    digest.valueHashes.reserve(serializedTorrent.size());
++    for (const QVariant &value : serializedTorrent)
++    {
++        m_valueBuffer.clear();
++        JsonWriter::appendValue(m_valueBuffer, value);
++        digest.valueHashes.append(jsonHash(m_valueBuffer));
++    }
++
++    return digest;
++}
++
++// Returns the fields of the torrent that changed since it was last processed (all of them for a new torrent).
++QVariantMap SyncController::processTorrent(const BitTorrent::TorrentID &torrentID, const QVariantMap &serializedTorrent)
++{
++    TorrentDigest digest = makeTorrentDigest(serializedTorrent);
++    TorrentDigest &prevDigest = m_torrentDigests[torrentID];
++    const bool sameKeys = (prevDigest.keys == digest.keys);
++
++    QVariantMap syncData;
++    qsizetype i = 0;
++    for (auto it = serializedTorrent.cbegin(); it != serializedTorrent.cend(); ++it, ++i)
++    {
++        quint64 prevHash = nullValueHash();
++        if (sameKeys)
++            prevHash = prevDigest.valueHashes[i];
++        else if (const qsizetype prevIndex = prevDigest.keys.indexOf(it.key()); prevIndex >= 0)
++            prevHash = prevDigest.valueHashes[prevIndex];
++
++        if (digest.valueHashes[i] != prevHash)
++            syncData.insert(it.key(), it.value());
++    }
++
++    prevDigest = std::move(digest);
++    return syncData;
++}
++
++// Writes every torrent as it is now and makes that what the client was last sent.
++void SyncController::appendAllTorrents(QByteArray &out)
++{
++    m_torrentDigests.clear();
++
++    JsonWriter::ObjectWriter torrentsObject {out};
++    for (const BitTorrent::Torrent *torrent : asConst(BitTorrent::Session::instance()->torrents()))
++    {
++        QVariantMap serializedTorrent = serialize(*torrent);
++        serializedTorrent.remove(KEY_TORRENT_ID);
++
++        m_torrentDigests.insert(torrent->id(), makeTorrentDigest(serializedTorrent));
++        JsonWriter::appendMap(torrentsObject.key(torrent->id().toString()), serializedTorrent);
++    }
++}
++
+ // GET param:
+ //   - hash (string): torrent hash (ID)
+ //   - rid (int): last response id
+diff --git a/src/webui/api/synccontroller.h b/src/webui/api/synccontroller.h
+index b6af285..5470ab3 100644
+--- a/src/webui/api/synccontroller.h
++++ b/src/webui/api/synccontroller.h
+@@ -58,8 +58,19 @@ private slots:
+     void torrentPeersAction();
+ 
+ private:
++    // What a client was last sent of a torrent: a hash of each field's JSON, in key order. A copy of the fields
++    // themselves took about 10 KiB per torrent and WebUI session.
++    struct TorrentDigest
++    {
++        QStringList keys;
++        QList<quint64> valueHashes;
++    };
++
+     void makeMaindataSnapshot();
+     QByteArray generateMaindataSyncData(int id, bool fullUpdate);
++    TorrentDigest makeTorrentDigest(const QVariantMap &serializedTorrent);
++    QVariantMap processTorrent(const BitTorrent::TorrentID &torrentID, const QVariantMap &serializedTorrent);
++    void appendAllTorrents(QByteArray &out);
+ 
+     void onCategoryAdded(const QString &categoryName);
+     void onCategoryRemoved(const QString &categoryName);
+@@ -108,10 +119,18 @@ private:
+         QStringList removedTags;
+         QStringList removedTorrents;
+         QStringList removedTrackers;
++
++        // the torrents to send are all of them, as they are now (a full update the client has not confirmed)
++        bool allTorrents = false;
+     };
+ 
++    // the torrents are kept in m_torrentDigests, not in m_maindataSnapshot.torrents
+     MaindataSyncBuf m_maindataSnapshot;
+     MaindataSyncBuf m_maindataSyncBuf;
+     int m_maindataLastSentID = 0;
+     int m_maindataAcceptedID = -1;
++    QHash<BitTorrent::TorrentID, TorrentDigest> m_torrentDigests;
++    // the keys of the last digested torrent, shared by the digests of torrents with the same keys
++    QStringList m_torrentKeys;
++    QByteArray m_valueBuffer;
+ };
