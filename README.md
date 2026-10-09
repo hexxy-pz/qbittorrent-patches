@@ -7,21 +7,24 @@ storage corruption bug and DNS leaks of tracker-supplied peer hostnames), both w
 is preloaded as the allocator. The client identity (peer ID, User-Agent, `--version`) stays the stock release's;
 the build fails if a patch touches it.
 
-Benchmarks ran on 7,800 to 8,900 seeding torrents. Each comparison is against the same version built unpatched
-with the same toolchain, unless noted.
+Benchmarks ran on 7,800 to 8,900 seeding torrents. "Before" is the same version built unpatched with the same
+toolchain, unless noted.
 
 ## Summary
 
-| Area | Patches | Result |
-|---|---|---|
-| Piece hashing (rechecks) | libtorrent 0001 | **+202 % throughput, -76 % CPU per GB** (32 hashing threads); +126 % / -61 % at 8 threads |
-| Opening the WebUI (`sync/maindata`) | qBittorrent 0001-0003 | **-65 % main-thread time** (1,267 to 444 ms); reload -77 %; `torrents/info` -56 % |
-| WebUI torrent table | qBittorrent 0004-0013 | **-81 % time to a usable table** (Chromium), -78 % (Firefox); -99 % DOM rows |
-| Tracker announces | libtorrent 0002, qBittorrent 0015-0016 | **-99.9 % connections** per HTTP/2 tracker, -94 % per HTTP/1.1 tracker; -99.8 % SYNs to a dead tracker |
-| Seed-to-seed connection churn | qBittorrent 0014 | up to 50 redundant outgoing connections per second to 0 (opt-in setting) |
-| Idle memory | libtorrent 0003-0004, qBittorrent 0017-0019, 0021-0022 | **-78 % RSS** with 0017-0019 (1,552 to 340 MB, ~8,900 torrents), 293 MB with 0021-0022 and mimalloc 3; **-77 % on a long-running instance** (2.0 GB to 465 MB) |
-| Memory allocator | **Scudo** preloaded (evaluated: musl, jemalloc, mimalloc 2/3 regular and secure, Scudo) | **-10 % memory** against musl at about its speed, with the strongest heap hardening |
-| WebUI session memory | qBittorrent 0020 | 85-120 MB pinned per cookieless `sync/maindata` call, unbounded, to capped |
+| | Before | After | Result | Patches |
+|---|---|---|---|---|
+| Recheck speed, 32 hashing threads | 3.0 GB/s | 9.0 GB/s | **3× faster**, ¼ of the CPU per GB | libtorrent 0001 |
+| Recheck speed, 8 hashing threads | 2.8 GB/s | 6.3 GB/s | **2.3× faster**, 40 % of the CPU per GB | libtorrent 0001 |
+| Opening the WebUI | 1.27 s | 0.44 s | **2.9× faster** | qBittorrent 0001-0003 |
+| Torrent table usable in the browser (Chromium) | 7.4 s | 1.4 s | **5× faster** | qBittorrent 0004-0013 |
+| Connections to one HTTP/2 tracker (2,200 torrents) | 2,200 | 3 | **99.9 % fewer** | libtorrent 0002 |
+| Connection attempts to a dead tracker, 4 minutes | 17,550 | ~40 | **99.8 % fewer** | libtorrent 0002 |
+| Redundant outgoing connections from seeds | up to 50 per second | 0 | opt-in setting | qBittorrent 0014 |
+| Idle memory (~8,900 torrents) | 1,550 MB | 340 MB | **4.6× less** | libtorrent 0003, qBittorrent 0017-0019 |
+| Idle memory, long-running instance | 2.0 GB | 465 MB | **4.3× less** | libtorrent 0003-0004, qBittorrent 0017-0022 |
+| Memory allocator: musl → Scudo | ~335 MB | ~300 MB | **10 % less memory**, same speed, strongest heap hardening | Dockerfile |
+| WebUI sessions from clients without cookies | unlimited, 85-120 MB each | at most 32 | memory capped | qBittorrent 0020 |
 
 Every new behaviour has a setting in the WebUI (Options), the WebAPI preferences and `qBittorrent.conf`.
 
@@ -83,8 +86,10 @@ took the store buffer's global mutex, a file pool lookup and a fresh scratch all
 whole v1 piece per storage call when none of its blocks are pending writes, and reads in bounded 256 KiB
 chunks.
 
-- 32 threads: 2.97 to 8.97 GB/s (+202 %), 114 to 478 MB hashed per CPU-second (-76 % CPU per GB)
-- 8 threads: 2.78 to 6.29 GB/s (+126 %), 454 to 1,171 MB per CPU-second (-61 % CPU per GB)
+| Hashing threads | Speed before | Speed after | Data hashed per CPU-second before | after | Result |
+|---|---|---|---|---|---|
+| 32 | 2.97 GB/s | 8.97 GB/s | 114 MB | 478 MB | 3× faster, ¼ of the CPU per GB |
+| 8 | 2.78 GB/s | 6.29 GB/s | 454 MB | 1,171 MB | 2.3× faster, 40 % of the CPU per GB |
 
 ### 0002: per-tracker announce queues, down-tracker detection, pooled HTTP/2 transport
 Stock libtorrent sends every HTTP(S) announce through one global queue, each on its own connection with
@@ -101,20 +106,23 @@ Stock libtorrent sends every HTTP(S) announce through one global queue, each on 
 - The queue timer is cancelled when nothing waits on it (it used to keep a shutting-down session alive for up
   to the queue timeout)
 
-Benchmark, 6,750 seeding torrents against five fake trackers:
+Benchmark: 6,750 seeding torrents against five fake trackers.
 
-| | stock | patched | change |
+| | Before | After | Result |
 |---|---|---|---|
-| connections, HTTP/2 tracker (2,200 torrents) | 2,200 | 3 | -99.9 % |
-| connections, HTTP/1.1 tracker (550 torrents) | 550 | 32 | -94 % |
-| plain HTTP tracker queued behind slow ones: all announced | 18.5 s | 7.8 s | -58 % |
-| SYNs to a dead tracker in 4 minutes | 17,550 | ~40 | -99.8 % |
-| shutdown, all `stopped` announces delivered | 21.2 s | 17.4 s | -18 % |
-| dead tracker back after 7 minutes: all announced | 0 of 650 within 60 s | 45 s | |
+| Connections to an HTTP/2 tracker (2,200 torrents) | 2,200 | 3 | 99.9 % fewer |
+| Connections to an HTTP/1.1 tracker (550 torrents) | 550 | 32 | 94 % fewer |
+| Fast tracker stuck behind slow ones: time until all announced | 18.5 s | 7.8 s | 2.4× faster |
+| Connection attempts to a dead tracker in 4 minutes | 17,550 | ~40 | 99.8 % fewer |
+| Shutdown: time until all `stopped` announces are delivered | 21.2 s | 17.4 s | 18 % faster |
+| Tracker back after a 7-minute outage: all 650 torrents announced | none within 60 s | within 45 s | |
 
-Trade-offs: a fast HTTP/1.1 tracker took 10.9 s instead of 3.7 s for its startup burst (the per-tracker limit
-starts at 4 connections and grows), and a tracker back after a 2-minute outage was fully announced to in 25 s
-instead of 15 s (probe back-off).
+Trade-offs, where the patch is slower:
+
+| | Before | After |
+|---|---|---|
+| Startup burst to a fast HTTP/1.1 tracker (the per-tracker limit starts at 4 connections and grows) | 3.7 s | 10.9 s |
+| Tracker back after a 2-minute outage: all announced (probe back-off) | 15 s | 25 s |
 
 ### 0003: load SHA-1 piece hashes on demand
 Piece hashes were 99 % of the metadata (792 of 803 MB) and stayed in memory for every torrent, although a seed
@@ -124,8 +132,12 @@ the info-hash, then free it again when idle. A torrent freed too early backs off
 so busy torrents do not thrash. Released hashes are freed one release cycle later, so pointers handed to
 other threads stay valid.
 
-- Reload from the qBittorrent database: p50 0.23 ms, p99 2.0 ms, max 15 ms (5 MB of metadata); with heavy
-  concurrent database writes p99 2.5 ms
+Time to load a torrent's hashes back from the qBittorrent database:
+
+| | Typical (p50) | 99th percentile | Worst |
+|---|---|---|---|
+| Normal | 0.23 ms | 2.0 ms | 15 ms (5 MB of metadata) |
+| Heavy concurrent database writes | | 2.5 ms | |
 
 ### 0004: no peer list for seeds that never connect out
 With `seeding_outgoing_connections` off, a seeding torrent never connects to the peers trackers and resume
@@ -137,28 +149,30 @@ from the trackers' reported counts.
 
 ### 0001-0003: faster `sync/maindata` and `torrents/info`
 Compile constant path regexes once, write the JSON directly instead of through `QJsonObject`, gzip large
-responses at level 1.
+responses at level 1. Responses are value-for-value identical to stock.
 
-| request (~7,800 torrents) | stock | patched | change |
+| Request (~7,800 torrents) | Before | After | Result |
 |---|---|---|---|
-| `maindata`, new session (opening the WebUI) | 1,267 ms | 444 ms | -65 % |
-| `maindata`, same session (reload) | 927 ms | 218 ms | -77 % |
-| `torrents/info?includeTrackers=true` | 1,598 ms | 708 ms | -56 % |
-
-Responses are value-for-value identical to stock. RSS after the runs: -21 % (1.9 to 1.5 GiB).
+| Opening the WebUI (`maindata`, new session) | 1,267 ms | 444 ms | 2.9× faster |
+| Reloading the WebUI (`maindata`, same session) | 927 ms | 218 ms | 4.3× faster |
+| `torrents/info?includeTrackers=true` | 1,598 ms | 708 ms | 2.3× faster |
+| Memory after the runs | 1.9 GiB | 1.5 GiB | 21 % less |
 
 ### 0004-0013: WebUI virtual list (backport from 5.2)
 Upstream's virtual list, cherry-picked with authors kept and on by default: the tables render only the rows in
 view.
 
-- Torrent table usable after 7.4 to 1.4 s in Chromium (-81 %), 7.7 to 1.7 s in Firefox (-78 %)
-- ~7,800 to 56 table rows in the DOM (-99 %)
+| ~7,800 torrents | Before | After | Result |
+|---|---|---|---|
+| Torrent table usable, Chromium | 7.4 s | 1.4 s | 5× faster |
+| Torrent table usable, Firefox | 7.7 s | 1.7 s | 4.5× faster |
+| Table rows in the page | ~7,800 | 56 | 99 % fewer |
 
 ### 0014: setting for outgoing connections of seeding torrents
-Exposes libtorrent's `seeding_outgoing_connections`. On private trackers the peer lists are almost all seeds;
-a seed connecting out to them only produces connections closed as redundant: up to 50 outgoing connections
-per second, 89 % to seeds, with the sweep starting over after every restart. Off, complete torrents only accept
-incoming connections. Default stays stock (on).
+Exposes libtorrent's `seeding_outgoing_connections`. On private trackers the peer lists are almost all seeds,
+and a seed connecting out to another seed only produces a connection that gets closed as redundant: up to 50
+outgoing connections per second, 89 % of them to seeds, starting over after every restart. Turned off,
+complete torrents only accept incoming connections. The default stays stock (on).
 
 ### 0015-0016: libtorrent settings in qBittorrent
 A generic `name=value` override for any libtorrent setting, and the tracker settings of libtorrent 0002 as
@@ -172,27 +186,32 @@ saves about 48 MB at ~8,900 single-tracker torrents.
 ### 0018: piece bitfields of seeds as flags
 Each torrent kept its piece bitfield up to four times (status, a `QBitArray` copy, cached resume data, plus a
 `verified_pieces` copy nothing read). A seed's are all ones, so they are now flags, expanded only where a full
-bitfield is needed (about 25 MB at 39.6 million pieces).
+bitfield is needed. Saves about 25 MB at 39.6 million pieces.
 
 ### 0019: piece hashes from the resume database
 With the SQLite resume data storage, torrents start without their piece hashes in memory (libtorrent 0003);
 they are read back from the database on demand (own read-only SQLite connection, WAL) and freed after an idle
 time (default 15 minutes) when the torrent is not downloading, checking or moving.
 
-Idle RSS, ~8,900 torrents all seeding, 2 minutes after start:
+Idle memory, ~8,900 torrents all seeding, 2 minutes after start:
 
-| | RSS |
+| Build | Memory (RSS) |
 |---|---|
 | linuxserver 5.1.4, stock | 1,550 MB |
 | patches 0001-0016 | 1,552 MB |
-| all patches | **340 MB (-78 %)** |
+| patches 0001-0019 | **340 MB (4.6× less)** |
+| all patches (0001-0022), mimalloc 3 as the allocator | 293 MB |
 
 ### 0020: WebUI session limits
 Under the authentication bypass (localhost or a whitelisted subnet), every request without a session cookie
 started a new WebUI session kept for the whole session timeout, and one that called `sync/maindata` held a
-full snapshot (85-120 MB at ~8,000 torrents). A client polling without cookies could exhaust memory. New
-sessions are now provisional until their cookie comes back (default 60 s), with at most 8 sessions per client
-address and 32 in total; provisional sessions are evicted first.
+full snapshot (85-120 MB at ~8,000 torrents). A client polling without cookies could exhaust memory.
+
+| | Before | After |
+|---|---|---|
+| New session without its cookie coming back | kept for the session timeout | dropped after 60 s |
+| Sessions per client address | unlimited | 8 |
+| Sessions in total | unlimited | 32 (unconfirmed ones evicted first) |
 
 ### 0021: free the torrent extension's initial data
 qBittorrent's torrent extension collects a new torrent's full status (with its piece bitfields), trackers and
@@ -204,20 +223,23 @@ refreshed. They were two levels of nested `QHash`es, each allocating 48 entries 
 waiting torrent: 29 MB while announces were failing. Now a flat list per torrent.
 
 ## Memory allocator
-qBittorrent on Alpine uses musl's allocator (mallocng). Same image, each candidate preloaded with
-`LD_PRELOAD`, ~8,900 torrents, three rounds against musl in the same run (rounds vary by about 10 %); load = 10
-full `sync/maindata` + 10 `torrents/info` with trackers, through one session:
+qBittorrent on Alpine uses musl's allocator (mallocng). Each candidate was preloaded with `LD_PRELOAD` into the
+same image, ~8,900 torrents, three rounds against musl in the same run (rounds vary by about 10 %). Load = 10
+full `sync/maindata` + 10 `torrents/info` with trackers, through one session.
 
-| allocator | idle RSS | peak in the first minutes | startup CPU | idle CPU | load CPU | `torrents/info` |
+| Allocator | Idle memory | Peak after start | Startup CPU | CPU under load | `torrents/info` | Heap hardening |
 |---|---|---|---|---|---|---|
-| musl (mallocng) | 332-341 MB | ~340 MB | 36-38 s | 4.5 s per 8 min | 8.5-9.8 s | 690-730 ms |
-| jemalloc 5.3 | +7 % | | -25 % | | -38 % | -37 % |
-| mimalloc 2.2 regular | +55 % (keeps freed memory) | | -28 % | | -44 % | -42 % |
-| mimalloc 3.5 regular | -3 % | ~610 MB | -27 % | -30 % | -46 % | -45 % |
-| mimalloc 3.5 secure | +3 % | **~1.4 GB** | -28 % | -2 % | -20 to -35 % | -24 to -39 % |
-| **Scudo** (LLVM) | **-10 %** | ~308 MB | -7 % | same | -4 % | -6 % |
+| musl (mallocng), stock | 335 MB | 340 MB | 37 s | 9.1 s | 710 ms | good |
+| jemalloc 5.3 | ~360 MB | | ~28 s | ~5.7 s | ~450 ms | |
+| mimalloc 2.2 | ~520 MB (keeps freed memory) | | ~27 s | ~5.1 s | ~410 ms | weak |
+| mimalloc 3.5 | ~325 MB | ~610 MB | ~27 s | ~4.9 s | ~390 ms | weak |
+| mimalloc 3.5 secure | ~345 MB | **~1.4 GB** | ~27 s | ~5.9-7.3 s | ~430-540 ms | good |
+| **Scudo** (LLVM), shipped | **~300 MB** | ~310 MB | ~34 s | ~8.8 s | ~670 ms | **strongest** |
 
-Security, from the sources (musl 1.2.5, mimalloc 3.5.0 with `MI_SECURE=ON`):
+musl's row is measured (midpoints of its rounds); the others are computed from their measured difference to musl
+and rounded. Blank: not measured (jemalloc's hardening was not assessed).
+
+Heap hardening, from the sources (musl 1.2.5, mimalloc 3.5.0 with `MI_SECURE=ON`):
 
 - **musl mallocng**: no free-list pointers inside freed memory (free slots are bitmasks in out-of-band
   metadata); every `free()` validates the slot header against the metadata and a per-process secret; double
@@ -230,10 +252,10 @@ Security, from the sources (musl 1.2.5, mimalloc 3.5.0 with `MI_SECURE=ON`):
   inconsistency. The hardened allocator Android uses.
 
 Scudo uses the least memory and hardens the most, at roughly musl's speed; regular mimalloc 3 is the fastest
-at musl's memory but gives up most heap hardening. The image ships **Scudo** (Alpine's signed `scudo-malloc`
-package, `LD_PRELOAD`; `-e LD_PRELOAD=` turns it off). Rechecks hash at the same CPU cost with it (1,206 vs
-1,135 MB per CPU-second for musl, 8 hashing threads). A running qbittorrent-nox binds `malloc`/`free` in Qt
-and libtorrent to Scudo, and the exporter reports the allocator in use (`qbittorrent_allocator_info`).
+but gives up most heap hardening. The image ships **Scudo** (Alpine's signed `scudo-malloc` package,
+`LD_PRELOAD`; `-e LD_PRELOAD=` turns it off). Rechecks cost the same CPU with it (1,206 MB hashed per
+CPU-second, musl 1,135 MB, 8 hashing threads). A running qbittorrent-nox binds `malloc`/`free` in Qt and
+libtorrent to Scudo, and the exporter reports the allocator in use (`qbittorrent_allocator_info`).
 
 ## Patch list
 
